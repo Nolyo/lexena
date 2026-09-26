@@ -1,7 +1,7 @@
 import type { Env, AuthenticatedUser } from "./types";
 import { chatCompletion, OpenAIError, type OpenAIModelTier } from "./openai";
 import { getPromptTemplate, isValidTask } from "./prompts";
-import { recordUsageEvent, fetchTrialStatus, fetchSubscriptionState } from "./usage";
+import { recordUsageEvent, checkTextProcessingAccess, QuotaExhausted } from "./usage";
 import { errorResponse } from "./errors";
 
 const MAX_INPUT_CHARS = 50_000;
@@ -54,17 +54,13 @@ export async function handlePostProcess(
   }
   const tier: OpenAIModelTier = body.model_tier === "full" ? "full" : "mini";
 
-  // Eligibility: post_process is gated by *any* of trial active OR active subscription.
-  // Parallel fetch — neither read depends on the other.
-  const [trial, sub] = await Promise.all([
-    fetchTrialStatus(env, user.user_id),
-    fetchSubscriptionState(env, user.user_id),
-  ]);
-  const eligible = trial.is_active || sub.status === "active";
-  if (!eligible) {
-    return errorResponse("quota_exhausted", "no active trial or subscription");
+  let source;
+  try {
+    source = await checkTextProcessingAccess(env, user.user_id);
+  } catch (err) {
+    if (err instanceof QuotaExhausted) return errorResponse("quota_exhausted", err.reason);
+    throw err;
   }
-  const source = trial.is_active ? "trial" : "quota";
 
   const template = getPromptTemplate(body.task);
   const userPrompt = template.buildUser(

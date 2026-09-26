@@ -56,6 +56,18 @@ beforeEach(() => {
 });
 
 describe("checkQuotaForTranscription priority", () => {
+  it("does not charge previous complimentary minutes to a paid subscription after grant revocation", async () => {
+    (createClient as ReturnType<typeof vi.fn>).mockReturnValue(mockSupabaseChain({
+      cloud_access_grants: { data: { revoked_at: "2026-01-01T00:00:00Z" }, error: null },
+      trial_status: { data: { is_active: false, minutes_remaining: 0 }, error: null },
+      subscriptions: { data: { status: "active", plan: "starter", quota_minutes: 400 }, error: null },
+      usage_summary: { data: { units_total: 1050, complimentary_units_total: 1000 }, error: null },
+    }));
+    await expect(checkQuotaForTranscription(ENV, "u1")).resolves.toEqual({
+      source: "quota", remaining_minutes_estimate: 350,
+    });
+  });
+
   it("prefers trial when active with minutes remaining", async () => {
     (createClient as ReturnType<typeof vi.fn>).mockReturnValue(
       mockSupabaseChain({

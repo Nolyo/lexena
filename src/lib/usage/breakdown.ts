@@ -1,5 +1,5 @@
 export interface UsageEventRow {
-  source: "trial" | "quota" | "overage";
+  source: "trial" | "quota" | "overage" | "complimentary";
   units: number;
 }
 

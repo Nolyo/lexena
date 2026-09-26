@@ -1,4 +1,10 @@
 {
+  "owner": {
+    "title": "Accès propriétaire",
+    "description": "Transcription et outils IA cloud activés sans abonnement payant.",
+    "usage": "{{used}} / {{quota}} minutes ce mois-ci",
+    "tokens": "Plafond de {{count}} tokens par mois pour les outils IA."
+  },
   "trial": {
     "minutes_remaining_one": "{{count}} min d'essai",
     "minutes_remaining_other": "{{count}} min d'essai",
@@ -39,7 +45,7 @@
   },
   "errors": {
     "provider_unavailable": "Le service de transcription cloud est temporairement indisponible. Réessayez dans quelques instants.",
-    "quota_exhausted": "Votre quota cloud est épuisé. Passez à un plan payant pour continuer.",
+    "quota_exhausted": "Votre quota cloud est épuisé ou votre accès a expiré. Vérifiez votre accès dans les paramètres Cloud.",
     "auth_expired": "Votre session a expiré. Reconnectez-vous pour utiliser le cloud.",
     "signin_required": "Lexena Cloud nécessite un compte. Connectez-vous ou choisissez un autre fournisseur dans les paramètres.",
     "not_eligible": "Aucun essai ni abonnement actif. Choisissez un autre fournisseur dans les paramètres ou souscrivez un plan.",

@@ -42,11 +42,11 @@ function detectReason(
 
 export function ExpirationPopup() {
   const { t } = useTranslation("billing");
-  const { trial, plan } = useCloud();
+  const { trial, plan, isCloudEligible, usageLoading } = useCloud();
   const [dismissed, setDismissed] = useState(false);
   const [open, setOpen] = useState(false);
 
-  const reason = detectReason(trial, plan);
+  const reason = isCloudEligible || usageLoading ? null : detectReason(trial, plan);
 
   useEffect(() => {
     if (reason && !dismissed) {

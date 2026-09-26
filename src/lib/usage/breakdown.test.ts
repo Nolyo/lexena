@@ -2,6 +2,12 @@ import { describe, it, expect } from "vitest";
 import { computeBreakdown, type UsageEventRow } from "./breakdown";
 
 describe("computeBreakdown", () => {
+  it("keeps complimentary usage out of the paid and trial breakdown", () => {
+    expect(computeBreakdown([
+      { source: "complimentary", units: 1000 },
+      { source: "quota", units: 3 },
+    ])).toEqual({ trial: 0, quota: 3, overage: 0 });
+  });
   it("returns zeros for an empty list", () => {
     expect(computeBreakdown([])).toEqual({ trial: 0, quota: 0, overage: 0 });
   });

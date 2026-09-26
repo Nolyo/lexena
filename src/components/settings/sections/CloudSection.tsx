@@ -16,7 +16,7 @@ function formatExpiry(iso: string | null): string {
 export function CloudSection() {
   const { t } = useTranslation("cloud");
   const { user } = useAuth();
-  const { trial, monthly_minutes_breakdown, plan, loading, refresh } = useUsage();
+  const { trial, monthly_minutes_breakdown, monthly_minutes_used, plan, ownerAccess, loading, refresh } = useUsage();
 
   if (!user) {
     return (
@@ -45,7 +45,21 @@ export function CloudSection() {
             {t("settings.heading")}
           </h2>
 
-          {plan && (
+          {ownerAccess && (
+            <section className="space-y-2">
+              <h3 className="text-[13px] font-semibold">{t("owner.title")}</h3>
+              <p className="text-[12.5px] text-muted-foreground">{t("owner.description")}</p>
+              <p className="text-[12.5px] vt-mono">{t("owner.usage", {
+                used: Math.floor(monthly_minutes_used), quota: ownerAccess.monthly_minutes_limit,
+              })}</p>
+              <p className="text-[12.5px] text-muted-foreground">{t("owner.tokens", { count: ownerAccess.monthly_tokens_limit })}</p>
+              {ownerAccess.expires_at && <p className="text-[12.5px] text-muted-foreground">
+                {t("settings.bonus.expires_at", { date: formatExpiry(ownerAccess.expires_at) })}
+              </p>}
+            </section>
+          )}
+
+          {!ownerAccess && plan && (
             <section className="space-y-3">
               <h3 className="text-[13px] font-semibold">
                 {t("settings.plan.heading", { plan: plan.plan })}
@@ -93,7 +107,7 @@ export function CloudSection() {
             </section>
           )}
 
-          {!plan && trial.is_active && (
+          {!ownerAccess && !plan && trial.is_active && (
             <section className="space-y-2">
               <h3 className="text-[13px] font-semibold">{t("settings.bonus.heading")}</h3>
               <p className="text-[12.5px] text-muted-foreground">
@@ -107,11 +121,11 @@ export function CloudSection() {
             </section>
           )}
 
-          {!plan && !trial.is_active && (
+          {!ownerAccess && !plan && !trial.is_active && (
             <p className="text-sm text-muted-foreground">{t("settings.nothing_active")}</p>
           )}
 
-          <section className="space-y-3 border-t pt-5">
+          {(!ownerAccess || plan) && <section className="space-y-3 border-t pt-5">
             <h3 className="text-[13px] font-semibold">
               {t("settings.section.plan_title")}
             </h3>
@@ -136,7 +150,7 @@ export function CloudSection() {
             ) : (
               <SubscribeButton />
             )}
-          </section>
+          </section>}
 
           <div>
             <button onClick={() => refresh()} className="vt-btn">

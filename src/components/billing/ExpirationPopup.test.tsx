@@ -46,6 +46,17 @@ import { ExpirationPopup } from "./ExpirationPopup";
 import { useCloud } from "@/hooks/useCloud";
 
 describe("ExpirationPopup", () => {
+  it("does not show an expired trial when server-managed cloud access is active", () => {
+    vi.mocked(useCloud).mockReturnValue({
+      trial: { is_active: false, minutes_remaining: 0, expires_at: "2020-01-01T00:00:00Z" },
+      plan: null,
+      isCloudEligible: true,
+    } as ReturnType<typeof useCloud>);
+    const { container } = render(<ExpirationPopup />);
+    expect(container).toBeEmptyDOMElement();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
   it("renders nothing when trial is still active", () => {
     (useCloud as ReturnType<typeof vi.fn>).mockReturnValue({
       trial: {

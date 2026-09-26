@@ -25,7 +25,7 @@ function firstOfNextMonth(): Date {
 export function SubscriptionCard({ onOpenAccountPage }: SubscriptionCardProps) {
   const { t } = useTranslation();
   const { status, openAuthModal } = useAuth();
-  const { trial, plan, monthly_minutes_used, loading } = useUsage();
+  const { trial, plan, ownerAccess, monthly_minutes_used, loading } = useUsage();
   const { formatLongDate, formatMonthDay } = useDateFormatters();
 
   // --- Signed-out: invite to create an account ----------------------------
@@ -60,6 +60,19 @@ export function SubscriptionCard({ onOpenAccountPage }: SubscriptionCardProps) {
         />
         <div className="mt-4 h-7 w-28 rounded-md bg-foreground/[0.06] animate-pulse" />
         <div className="mt-3 h-[7px] w-full rounded-full bg-foreground/[0.05] animate-pulse" />
+      </Card>
+    );
+  }
+
+  if (ownerAccess) {
+    return (
+      <Card>
+        <Header eyebrow={t("cloud:owner.title")} icon={<BadgeCheck className="w-4 h-4" />} />
+        <p className="mt-3 text-[13px] text-[var(--vt-fg-3)] leading-relaxed">{t("cloud:owner.description")}</p>
+        <p className="mt-3 vt-mono text-[13px]">{t("cloud:owner.usage", {
+          used: Math.round(monthly_minutes_used), quota: ownerAccess.monthly_minutes_limit,
+        })}</p>
+        <Foot onOpenAccountPage={onOpenAccountPage} />
       </Card>
     );
   }
