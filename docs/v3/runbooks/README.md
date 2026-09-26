@@ -8,6 +8,7 @@ Procédures opérationnelles pour la v3 (rotation secrets, backup, incident).
 - [`backup-restore-test.md`](backup-restore-test.md) — test trimestriel de restauration Supabase
 - [`incident-response.md`](incident-response.md) — plan incident + notification GDPR <72h
 - [`managed-transcription.md`](managed-transcription.md) — Worker Cloudflare api.lexena.app, providers Groq/OpenAI, monitoring + incidents
+- [`owner-cloud-access.md`](owner-cloud-access.md) — attribution, révocation et vérification de l'accès cloud propriétaire
 
 ## Convention
 

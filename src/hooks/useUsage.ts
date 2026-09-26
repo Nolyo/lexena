@@ -5,12 +5,14 @@ import {
   type UsagePlan,
 } from "@/contexts/CloudContext";
 import type { MonthlyBreakdown } from "@/lib/usage/breakdown";
+import type { CloudAccessGrant } from "@/lib/cloud/access";
 
 interface UsageData {
   trial: TrialStatus;
   monthly_minutes_used: number;
   monthly_minutes_breakdown: MonthlyBreakdown;
   plan: UsagePlan | null;
+  ownerAccess: CloudAccessGrant | null;
   loading: boolean;
   refresh: () => Promise<void>;
 }
@@ -26,6 +28,7 @@ export function useUsage(): UsageData {
     monthly_minutes_used: ctx.monthly_minutes_used,
     monthly_minutes_breakdown: ctx.monthly_minutes_breakdown,
     plan: ctx.plan,
+    ownerAccess: ctx.ownerAccess,
     loading: ctx.usageLoading,
     refresh: ctx.refreshUsage,
   };

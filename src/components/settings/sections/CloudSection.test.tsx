@@ -33,6 +33,7 @@ import "@testing-library/jest-dom/vitest";
 import { CloudSection } from "./CloudSection";
 import type { TrialStatus, UsagePlan } from "@/contexts/CloudContext";
 import type { MonthlyBreakdown } from "@/lib/usage/breakdown";
+import type { CloudAccessGrant } from "@/lib/cloud/access";
 
 const mockUseUsage = vi.fn();
 const mockUseAuth = vi.fn();
@@ -52,6 +53,7 @@ interface UsageState {
   monthly_minutes_used: number;
   monthly_minutes_breakdown: MonthlyBreakdown;
   plan: UsagePlan | null;
+  ownerAccess: CloudAccessGrant | null;
   loading: boolean;
   refresh: () => Promise<void>;
 }
@@ -78,6 +80,18 @@ afterEach(() => {
 });
 
 describe("CloudSection", () => {
+  it("shows owner access and allowance without an expired-trial or payment prompt", () => {
+    setUsage({
+      ownerAccess: { monthly_minutes_limit: 1000, monthly_tokens_limit: 1000000, expires_at: null },
+      monthly_minutes_used: 12,
+    });
+    render(<CloudSection />);
+    expect(screen.getByText("Accès propriétaire")).toBeInTheDocument();
+    expect(screen.getByText("12 / 1000 minutes ce mois-ci")).toBeInTheDocument();
+    expect(screen.queryByText(/aucun essai ni abonnement actif/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "subscribe" })).not.toBeInTheDocument();
+  });
+
   it("shows signin_required when no user", () => {
     mockUseAuth.mockReturnValue({ user: null });
     setUsage({});

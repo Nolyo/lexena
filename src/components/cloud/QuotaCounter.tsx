@@ -13,12 +13,23 @@ export function QuotaCounter() {
   const { t } = useTranslation("cloud");
   const { user } = useAuth();
   const { hasCloudSelected } = useCloud();
-  const { trial, monthly_minutes_breakdown, plan, loading } = useUsage();
+  const { trial, monthly_minutes_breakdown, monthly_minutes_used, plan, ownerAccess, loading } = useUsage();
 
   // Only surface the quota pill when the user actually opted into Lexena
   // Cloud. Showing it for users still on Local / their own keys would suggest
   // the cloud is consuming their quota when it isn't.
   if (!user || !hasCloudSelected || loading) return null;
+
+  if (ownerAccess) {
+    return (
+      <div className="text-xs vt-mono text-muted-foreground px-2 py-1 rounded-md border border-border bg-card/40"
+        title={t("owner.description")}>
+        {t("owner.title")} · {t("plan.minutes_remaining", {
+          count: Math.floor(Math.max(0, ownerAccess.monthly_minutes_limit - monthly_minutes_used)),
+        })}
+      </div>
+    );
+  }
 
   if (trial.is_active) {
     const days = daysUntil(trial.expires_at);

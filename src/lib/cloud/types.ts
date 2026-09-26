@@ -1,4 +1,4 @@
-export type CloudUsageSource = "trial" | "quota" | "overage";
+export type CloudUsageSource = "trial" | "quota" | "overage" | "complimentary";
 
 export interface TranscriptionResult {
   text: string;

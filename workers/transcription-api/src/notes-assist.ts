@@ -1,6 +1,6 @@
 import type { Env, AuthenticatedUser } from "./types";
 import { chatCompletion, OpenAIError, type OpenAIModelTier } from "./openai";
-import { recordUsageEvent, fetchTrialStatus, fetchSubscriptionState } from "./usage";
+import { recordUsageEvent, checkTextProcessingAccess, QuotaExhausted } from "./usage";
 import { errorResponse } from "./errors";
 
 const MAX_USER_TEXT_CHARS = 50_000;
@@ -15,7 +15,7 @@ interface NotesAssistBody {
 /**
  * Free-form AI assistant used by the Notes editor bubble menu. The caller
  * supplies its own system prompt (translate / improve / custom...). Eligibility
- * mirrors `/post-process`: trial active OR active subscription. Usage is
+ * mirrors `/post-process`: server grant, active trial or subscription. Usage is
  * accounted in tokens against the `post_process` bucket — the user's billing
  * surface treats AI text processing as a single category.
  */
@@ -54,15 +54,13 @@ export async function handleNotesAssist(
 
   const tier: OpenAIModelTier = body.model_tier === "full" ? "full" : "mini";
 
-  const [trial, sub] = await Promise.all([
-    fetchTrialStatus(env, user.user_id),
-    fetchSubscriptionState(env, user.user_id),
-  ]);
-  const eligible = trial.is_active || sub.status === "active";
-  if (!eligible) {
-    return errorResponse("quota_exhausted", "no active trial or subscription");
+  let source;
+  try {
+    source = await checkTextProcessingAccess(env, user.user_id);
+  } catch (err) {
+    if (err instanceof QuotaExhausted) return errorResponse("quota_exhausted", err.reason);
+    throw err;
   }
-  const source = trial.is_active ? "trial" : "quota";
 
   let result;
   try {

@@ -80,7 +80,7 @@ export function TranscriptionSection({ onSectionChange }: TranscriptionSectionPr
   // model is too degraded to expose in the UI.
   const { isDownloading, progress, isDownloaded, isChecking, download, remove } =
     useModelDownload(settings.transcription_provider, OFFICIAL_MODEL);
-  const { isCloudEligible, trial, plan } = useCloud();
+  const { isCloudEligible, trial, plan, ownerAccess } = useCloud();
   const { user, openAuthModal } = useAuth();
   const [isMigrating, setIsMigrating] = useState(false);
 
@@ -94,7 +94,9 @@ export function TranscriptionSection({ onSectionChange }: TranscriptionSectionPr
   });
 
   const cloudStatusBadge =
-    status.kind === "signin" ? (
+    isSignedIn && ownerAccess ? (
+      <ProviderBadge color="var(--vt-ok)">{t("cloud:owner.title")}</ProviderBadge>
+    ) : status.kind === "signin" ? (
       <ProviderBadge color="var(--vt-danger)">
         {t("settings.transcription.cloudStatus.signinRequired")}
       </ProviderBadge>

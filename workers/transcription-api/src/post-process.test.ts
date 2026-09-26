@@ -11,16 +11,9 @@ vi.mock("./openai", async () => {
 
 // Mock usage to bypass eligibility/recording. We want to reach the chatCompletion
 // call so the catch path runs.
-vi.mock("./usage", () => ({
-  fetchTrialStatus: vi.fn(async () => ({ is_active: true, minutes_remaining: 60 })),
-  fetchSubscriptionState: vi.fn(async () => ({
-    status: "active",
-    plan: "starter",
-    quota_minutes: 1000,
-    overage_minutes_allowed: 300,
-    current_month: "2026-05",
-    used_minutes_this_month: 0,
-  })),
+vi.mock("./usage", async (original) => ({
+  ...await original<typeof import("./usage")>(),
+  checkTextProcessingAccess: vi.fn(async () => "trial"),
   recordUsageEvent: vi.fn(async () => ({ event_id: "evt_test", deduplicated: false })),
 }));
 

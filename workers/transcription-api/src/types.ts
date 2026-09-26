@@ -13,7 +13,7 @@ export interface AuthenticatedUser {
 
 export type UsageKind = "transcription" | "post_process";
 export type UsageUnit = "minutes" | "tokens";
-export type UsageSource = "trial" | "quota" | "overage";
+export type UsageSource = "trial" | "quota" | "overage" | "complimentary";
 
 export interface UsageEventInput {
   user_id: string;
