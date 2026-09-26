@@ -1,6 +1,6 @@
 [package]
 name = "lexena"
-version = "3.2.1"
+version = "3.2.2-beta.1"
 description = "Transform your voice in text in real-time using AI models."
 authors = ["Yohann JAFFRES <contact@yohann-jaffres.fr>"]
 edition = "2021"
