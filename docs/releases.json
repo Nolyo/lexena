@@ -2,33 +2,58 @@
   "schema_version": "1.0",
   "app_name": "Lexena",
   "repository": "Nolyo/lexena",
-  "generated_at": "2026-08-07T09:50:15.300Z",
+  "generated_at": "2026-09-26T11:54:15.491Z",
   "latest": {
-    "version": "3.2.0",
-    "tag": "v3.2.0",
-    "published_at": "2026-07-28T12:57:40Z",
-    "changelog_url": "https://github.com/Nolyo/lexena/releases/tag/v3.2.0",
-    "release_notes": "See the [CHANGELOG](https://github.com/Nolyo/lexena/blob/v3.2.0/CHANGELOG.md) for details.\r\n\r\n## Downloads\r\n\r\n- **lexena-v3.2.0-portable.exe** : Portable version (no installation required)\r\n- **lexena-v3.2.0-setup.exe** : NSIS installer (recommended)\r\n\r\nVerify file integrity using the provided SHA256 checksums.\r\n\r\n## Auto-Update Support\r\n\r\nThis release includes signed update artifacts for automatic in-app updates.",
+    "version": "3.2.1",
+    "tag": "v3.2.1",
+    "published_at": "2026-08-07T09:50:02Z",
+    "changelog_url": "https://github.com/Nolyo/lexena/releases/tag/v3.2.1",
+    "release_notes": "See the [CHANGELOG](https://github.com/Nolyo/lexena/blob/v3.2.1/CHANGELOG.md) for details.\r\n\r\n## Downloads\r\n\r\n- **lexena-v3.2.1-portable.exe** : Portable version (no installation required)\r\n- **lexena-v3.2.1-setup.exe** : NSIS installer (recommended)\r\n\r\nVerify file integrity using the provided SHA256 checksums.\r\n\r\n## Auto-Update Support\r\n\r\nThis release includes signed update artifacts for automatic in-app updates.",
     "windows": {
       "portable": {
-        "filename": "lexena-v3.2.0-portable.exe",
-        "url": "https://github.com/Nolyo/lexena/releases/download/v3.2.0/lexena-v3.2.0-portable.exe",
+        "filename": "lexena-v3.2.1-portable.exe",
+        "url": "https://github.com/Nolyo/lexena/releases/download/v3.2.1/lexena-v3.2.1-portable.exe",
         "size_bytes": 43507712,
         "size_human": "41.5 MB",
-        "sha256": "fb2d5bfda11b2b107f933f1fbdbb1208d80fb1857e8f651d21d88953027c4f88",
-        "download_count": 0
+        "sha256": "0d517938192b0963c4cb4d2735a72dc912111fb7856a74dcfd100b18ec920184",
+        "download_count": 4
       },
       "nsis_installer": {
-        "filename": "lexena-v3.2.0-setup.exe",
-        "url": "https://github.com/Nolyo/lexena/releases/download/v3.2.0/lexena-v3.2.0-setup.exe",
-        "size_bytes": 9045700,
+        "filename": "lexena-v3.2.1-setup.exe",
+        "url": "https://github.com/Nolyo/lexena/releases/download/v3.2.1/lexena-v3.2.1-setup.exe",
+        "size_bytes": 9044873,
         "size_human": "8.6 MB",
-        "sha256": "32a70672a3e7546f9ea2643faf91cfdcc270a9f70f2100cd3b68ed956adac7f0",
-        "download_count": 0
+        "sha256": "1f27cf90e11cc34cd10877e3a22e8098123fa4d6263c691f10cc17b288031e71",
+        "download_count": 1
       }
     }
   },
   "releases": [
+    {
+      "version": "3.2.1",
+      "tag": "v3.2.1",
+      "published_at": "2026-08-07T09:50:02Z",
+      "changelog_url": "https://github.com/Nolyo/lexena/releases/tag/v3.2.1",
+      "release_notes": "See the [CHANGELOG](https://github.com/Nolyo/lexena/blob/v3.2.1/CHANGELOG.md) for details.\r\n\r\n## Downloads\r\n\r\n- **lexena-v3.2.1-portable.exe** : Portable version (no installation required)\r\n- **lexena-v3.2.1-setup.exe** : NSIS installer (recommended)\r\n\r\nVerify file integrity using the provided SHA256 checksums.\r\n\r\n## Auto-Update Support\r\n\r\nThis release includes signed update artifacts for automatic in-app updates.",
+      "windows": {
+        "portable": {
+          "filename": "lexena-v3.2.1-portable.exe",
+          "url": "https://github.com/Nolyo/lexena/releases/download/v3.2.1/lexena-v3.2.1-portable.exe",
+          "size_bytes": 43507712,
+          "size_human": "41.5 MB",
+          "sha256": "0d517938192b0963c4cb4d2735a72dc912111fb7856a74dcfd100b18ec920184",
+          "download_count": 4
+        },
+        "nsis_installer": {
+          "filename": "lexena-v3.2.1-setup.exe",
+          "url": "https://github.com/Nolyo/lexena/releases/download/v3.2.1/lexena-v3.2.1-setup.exe",
+          "size_bytes": 9044873,
+          "size_human": "8.6 MB",
+          "sha256": "1f27cf90e11cc34cd10877e3a22e8098123fa4d6263c691f10cc17b288031e71",
+          "download_count": 1
+        }
+      }
+    },
     {
       "version": "3.2.0",
       "tag": "v3.2.0",
@@ -42,7 +67,7 @@
           "size_bytes": 43507712,
           "size_human": "41.5 MB",
           "sha256": "fb2d5bfda11b2b107f933f1fbdbb1208d80fb1857e8f651d21d88953027c4f88",
-          "download_count": 0
+          "download_count": 1
         },
         "nsis_installer": {
           "filename": "lexena-v3.2.0-setup.exe",
