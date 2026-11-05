@@ -39,6 +39,9 @@ AGENTS.md
 
 .design-handoff/
 
+# Local implementation ledgers and test output
+.superpowers/
+
 # Auto Claude generated files
 .auto-claude-security.json
 .auto-claude-status
