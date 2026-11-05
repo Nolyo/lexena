@@ -5,6 +5,7 @@ use tokio::{
     sync::{watch, Semaphore},
     task::{JoinHandle, JoinSet},
 };
+#[cfg(test)]
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -117,9 +118,6 @@ impl LocalMcpRuntime {
             task: Some(task),
         })
     }
-    pub fn revoke(&self, store: &connections::GrantStore, id: Uuid) -> Result<()> {
-        store.revoke(id)
-    }
     pub fn is_running(&self) -> bool {
         self.task.as_ref().is_some_and(|task| !task.is_finished())
     }
@@ -152,7 +150,6 @@ mod runtime_tests {
                 "session".into(),
                 vec![super::super::permissions::ProfileIdentity {
                     id: "default".into(),
-                    name: "Default".into(),
                     created_at: "2026-01-01T00:00:00Z".into(),
                 }],
                 vec![connections::Scope::NotesWrite],
@@ -248,7 +245,6 @@ mod runtime_tests {
                 "test".into(),
                 vec![super::super::permissions::ProfileIdentity {
                     id: "default".into(),
-                    name: "Default".into(),
                     created_at: "2026-01-01T00:00:00Z".into(),
                 }],
                 vec![connections::Scope::NotesRead],
@@ -296,7 +292,7 @@ mod runtime_tests {
             .await
             .is_err());
         }
-        runtime.revoke(&store, grant.id).unwrap();
+        store.revoke(grant.id).unwrap();
         for client in &mut clients {
             let mut b = [0; 1];
             let read = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut b))

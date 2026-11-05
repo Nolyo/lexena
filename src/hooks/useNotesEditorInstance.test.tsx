@@ -50,7 +50,7 @@ describe("shared main/detached editor hook",()=>{
     await act(async()=>{finishEnd();});
     await waitFor(()=>expect(result.current.isLoadingContent).toBe(false));
     expect(ipc.invoke.mock.calls.filter(([cmd,args])=>cmd==="register_note_editor" && args.noteId==="a")).toHaveLength(2);
-    expect(state.editor.setEditable).toHaveBeenLastCalledWith(true);
+    expect(state.editor.setEditable).toHaveBeenLastCalledWith(true, false);
     act(()=>{state.html="returned draft";state.options!.onUpdate({editor:state.editor});});
     await act(async()=>{await result.current.flushSave();});
     expect(ipc.invoke).toHaveBeenCalledWith("save_editor_note",expect.objectContaining({content:"returned draft",context:expect.objectContaining({note_id:"a"})}));
@@ -74,7 +74,7 @@ describe("shared main/detached editor hook",()=>{
     expect(result.current.loadedNoteId).toBe("a");
     expect(result.current.saveError).toMatch(/copiez votre texte/i);
     expect(state.html).toBe("<p>retained recovery draft</p>");
-    expect(state.editor.setEditable).toHaveBeenLastCalledWith(false);
+    expect(state.editor.setEditable).toHaveBeenLastCalledWith(false, false);
     expect(localStorage.getItem("lexena:note-draft:work:a")).toBe(JSON.stringify({content:state.html,revision:"r1"}));
     expect(state.editor.commands.setContent).toHaveBeenCalledTimes(1);
     expect(ipc.invoke.mock.calls.filter(([command])=>command==="register_note_editor")).toHaveLength(1);

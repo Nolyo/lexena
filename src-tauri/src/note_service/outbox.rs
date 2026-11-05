@@ -1,5 +1,7 @@
 use super::journal::{atomic_json, files_in, read_json};
-use super::{DomainError, LockedProfile, ProfileScope};
+#[cfg(test)]
+use super::ProfileScope;
+use super::{DomainError, LockedProfile};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -754,6 +756,7 @@ impl LocalOutbox {
             entities: entities.into_values().collect(),
         })
     }
+    #[cfg(test)]
     pub fn list_pending(scope: &ProfileScope) -> Result<Vec<OutboxEntry>, DomainError> {
         scope.transaction(Self::list_pending_locked)
     }
@@ -771,6 +774,7 @@ impl LocalOutbox {
         Ok(entries)
     }
     /// Caller must first durably save the queue AND its import watermark (Task 7).
+    #[cfg(test)]
     pub fn ack(scope: &ProfileScope, through: u64) -> Result<(), DomainError> {
         scope.transaction(|p| Self::ack_locked(p, through))
     }

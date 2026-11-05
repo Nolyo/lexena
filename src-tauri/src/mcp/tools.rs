@@ -45,7 +45,9 @@ pub trait EditorAdapter: Send + Sync + 'static {
     fn finish(&self, permit: &EditPermit, committed: bool);
     fn changed(&self, _change: Change) {}
 }
+#[cfg(test)]
 pub struct LocalEditors;
+#[cfg(test)]
 impl EditorAdapter for LocalEditors {
     fn prepare<'a>(&'a self, scope: &'a ProfileScope, note_id: &'a str) -> PrepareFuture<'a> {
         Box::pin(async move {

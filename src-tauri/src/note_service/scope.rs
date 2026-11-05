@@ -502,6 +502,7 @@ impl ProfileRegistry {
             .name = name.trim().into();
         write_manifest(&scope.app_data, &manifest)
     }
+    #[cfg(test)]
     pub fn switch_in(app_data: &Path, id: &str) -> Result<ProfileScope, DomainError> {
         Self::switch_with_preflight_in(app_data, id, |_| Ok(()), |_, ()| {})
     }

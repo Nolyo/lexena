@@ -281,7 +281,9 @@ export function useNotesEditorInstance({
         return;
       }
       clearTimeout(saveTimerRef.current);
-      editor.setEditable(false);
+      // TipTap emits an update by default even when only editability changes.
+      // Ownership transitions must not be mistaken for a pending keystroke.
+      editor.setEditable(false, false);
       setIsLoadingContent(true);
       try {
         if (previous) {
@@ -311,7 +313,7 @@ export function useNotesEditorInstance({
           read:context => invoke<EditorRead>("read_editor_note",{context}),
           end:context => invoke("end_note_edit",{context}),
         },{
-          setEditable:value => editor.setEditable(value),
+          setEditable:value => editor.setEditable(value, false),
           load,
           conflict:error => {
             console.error("Note draft retained:",error);
@@ -342,7 +344,7 @@ export function useNotesEditorInstance({
         }
         load(owner.content);
         setLoadedNoteId(activeNoteId);
-        editor.setEditable(!owner.conflicted);
+        editor.setEditable(!owner.conflicted, false);
         if (!owner.conflicted && isBlankContent(owner.content)) editor.commands.focus("start");
       } catch (error) {
         console.error("Failed to switch note editor:",error);

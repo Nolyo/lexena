@@ -217,12 +217,6 @@ enum ResultSchema<T> {
     Success(T),
     Error(BusinessError),
 }
-/// Internal representation used by adapters; SDK wire format is structuredContent plus text.
-pub struct McpToolResult<T> {
-    pub structured_content: T,
-    pub text: String,
-}
-
 pub fn permission(name: &str) -> Option<Scope> {
     Some(match name {
         "lexena_get_context" | "lexena_list_profiles" => return None,

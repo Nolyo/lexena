@@ -164,6 +164,7 @@ impl FolderRepository {
     pub fn list(scope: &ProfileScope) -> Result<Vec<FolderMeta>, DomainError> {
         scope.transaction(|p| Self::list_locked(p))
     }
+    #[cfg(test)]
     pub fn get(scope: &ProfileScope, id: &str) -> Result<FolderMeta, DomainError> {
         scope.transaction(|p| Self::get_locked(p, id))
     }

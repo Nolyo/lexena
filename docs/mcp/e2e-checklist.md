@@ -93,7 +93,7 @@ Validation stricte des schémas : **0 erreur**, **47 avertissements de portabili
 
 La relecture globale puis la relecture des correctifs ont approuvé les protections de réinitialisation, le drainage des requêtes et audits, ainsi que l'ordre de rechargement des métadonnées et révisions des éditeurs. Les suites complètes ci-dessus ont été exécutées après ces correctifs. Les scénarios d'installation et d'interface native restent à effectuer.
 
-### Build natif local
+### Build natif local du lot initial (`4ea574f`)
 
 Le build CPU par la CLI Tauri a compilé l'application release et produit un NSIS le 5 novembre. La commande standard a ensuite échoué lors de la génération de la signature d'updater, car `TAURI_SIGNING_PRIVATE_KEY` n'était pas fournie. La clé privée de signature n'a pas été chargée ; aucune identité de signature n'a été créée ou modifiée pour contourner cette étape.
 
@@ -120,3 +120,13 @@ Service MCP de production compilé en release, appels `invoke` incluant autorisa
 | Recherche lexicale | 37,47 ms | 55,70 ms | < 1 500 ms |
 
 La première construction a renvoyé `TIMEOUT` après 30 028 ms. Le job suivi a été laissé se terminer avant la mesure chaude ; il n'a pas été abandonné. Durée du scénario complet, création du corpus comprise : 131 secondes. Ces mesures valident ce corpus et ce poste ; elles ne remplacent pas les essais d'installation ou d'éditeur avec une session native.
+
+### Correction des faux conflits d'éditeur — 5 novembre 2026
+
+Les premiers essais utilisateurs avec Copilot et Codex ont révélé un blocage des onglets après un faux conflit. Le vrai TipTap émet `update` par défaut sur `setEditable`, sans changement de document ; l'adaptateur d'ownership interprétait cette notification comme une frappe pendant sa propre pause. Le double utilisé par les tests précédents ne reproduisait pas cette émission.
+
+Les transitions d'édition passent désormais explicitement `emitUpdate: false`. Un brouillon de récupération strictement identique, octet pour octet, au HTML déjà enregistré peut être nettoyé sans réécriture ; un brouillon différent conserve sa protection contre les conflits. Quatre tests utilisant le vrai TipTap couvrent l'ouverture et le changement d'onglet sans écriture parasite, le rafraîchissement externe, les vraies frappes sauvegardées et la récupération du doublon. Trois de ces cas échouaient avant la correction.
+
+Suite frontend après correction : **715 tests réussis dans 95 fichiers** ; TypeScript sans erreur. Build frontend réussi avec un répertoire de sortie de validation séparé ; seul l'avertissement de taille des chunks Vite subsiste. Bibliothèque Tauri : **237 tests réussis, aucun échec**, avec la fixture enfant exécutée explicitement par son parent. `cargo check --no-default-features --lib --locked` et cette suite native terminent tous deux sans warning Rust après retrait des fonctions inutilisées et séparation des helpers de test. La relecture indépendante approuve la correction et a également exécuté les 31 tests ciblés.
+
+Les artefacts NSIS et ZIP décrits plus haut correspondent au lot initial, avant cette correction, et doivent être reconstruits avant distribution. Une relance de l'application charge la correction et libère l'ancien état de faux conflit ; ne pas vider le stockage des brouillons pour contourner un conflit portant sur un contenu différent.

@@ -1015,6 +1015,7 @@ impl NoteService {
     ) -> Result<T, DomainError> {
         scope.transaction(action)
     }
+    #[cfg(test)]
     pub fn mutate(
         scope: &ProfileScope,
         intent: MutationIntent,
@@ -1034,6 +1035,7 @@ impl NoteService {
         };
         Ok(Self::mutate_checked_locked(profile, request, actor, |_| Ok(()))?.result)
     }
+    #[cfg(test)]
     pub fn mutate_checked(
         scope: &ProfileScope,
         request: MutationRequest,

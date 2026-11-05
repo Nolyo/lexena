@@ -80,14 +80,10 @@ impl SessionActor {
     }
 }
 pub struct AuthorizationLease<'a> {
-    actor: SessionActor,
     grant: &'a ConnectionGrant,
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl AuthorizationLease<'_> {
-    pub fn actor(&self) -> SessionActor {
-        self.actor
-    }
     pub fn allows(&self, scope: Scope) -> bool {
         self.grant.scopes.contains(&scope)
     }
@@ -133,7 +129,6 @@ impl GrantStore {
             .ok_or(Error::Denied)?;
         // `grant` borrows the guard: it remains locked until work has returned.
         Ok(work(&AuthorizationLease {
-            actor: *actor,
             grant,
             _not_send: std::marker::PhantomData,
         }))
@@ -479,8 +474,8 @@ impl GrantStore {
         self.grant(id)?;
         lexena_mcp_ipc::read_secret(self.snapshot()?.installation_id, id)
     }
-    /// Scope predicate only. Read entry checks use permissions::authorize;
-    /// commits must retain with_authorization inside the profile transaction.
+    /// Test fixture predicate. Production checks retain with_authorization.
+    #[cfg(test)]
     pub fn allows(&self, id: Uuid, profile: &str, scope: Scope) -> bool {
         self.grant(id).is_ok_and(|grant| {
             grant.profile_ids.iter().any(|id| id == profile) && grant.scopes.contains(&scope)

@@ -100,7 +100,6 @@ fn validate_profiles(
                     .find(|p| &p.id == id)
                     .map(|p| mcp::permissions::ProfileIdentity {
                         id: p.id.clone(),
-                        name: p.name.clone(),
                         created_at: p.created_at.clone(),
                     })
                     .ok_or(Error::Denied)

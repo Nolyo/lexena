@@ -20,7 +20,12 @@ export class EditorOwnership {
  private failure:unknown=null;
  private closing:Promise<void>|null=null;
  constructor(public context:EditorContext,public content:string,private transport:EditorTransport,private view:EditorView){}
- restoreDraft(content:string,revision:string){this.content=content;this.dirty=true;this.epoch++;if(revision!==this.context.loaded_revision){this.fail(Error('REVISION_CONFLICT'));}else{this.change(content);}}
+ restoreDraft(content:string,revision:string){
+  // An earlier non-document update could retain the already-persisted HTML.
+  // Discard only that byte-identical duplicate, never a different recovery draft.
+  if(!this.dirty&&content===this.content){this.view.persist(this.context,null);return;}
+  this.content=content;this.dirty=true;this.epoch++;if(revision!==this.context.loaded_revision){this.fail(Error('REVISION_CONFLICT'));}else{this.change(content);}
+ }
  private fail(error:unknown) {this.failure=error;this.conflicted=true;this.view.conflict(error);}
  private isCurrentRead(generation:number,prepareId:string|null) {
   return generation===this.readGeneration&&prepareId===this.prepareId;

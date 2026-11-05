@@ -208,6 +208,7 @@ impl EditorRegistry {
         }
         Ok(EditorSwitchGuard { state })
     }
+    #[cfg(test)]
     pub fn invalidate_sessions(&self) -> Result<(), DomainError> {
         self.prepare_profile_switch()?.commit();
         Ok(())
@@ -359,6 +360,7 @@ impl EditorRegistry {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub fn saved(
         &self,
         window: &str,

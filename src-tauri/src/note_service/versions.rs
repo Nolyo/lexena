@@ -1,6 +1,8 @@
 use super::journal::{files_in, read_json, RETENTION_SECONDS};
 use super::repository::NoteData;
-use super::{DomainError, LockedProfile, ProfileScope};
+#[cfg(test)]
+use super::ProfileScope;
+use super::{DomainError, LockedProfile};
 use serde::{Deserialize, Serialize};
 pub const HISTORY_BUDGET: u64 = 268_435_456;
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,23 +16,7 @@ pub struct NoteVersion {
 }
 pub struct VersionStore;
 impl VersionStore {
-    pub fn restore(
-        scope: &ProfileScope,
-        request: super::mutation::MutationRequest,
-        actor: super::mutation::Actor,
-        authorize: impl FnMut(&LockedProfile<'_>) -> Result<(), DomainError>,
-    ) -> Result<super::mutation::MutationReceipt, DomainError> {
-        if !matches!(
-            request.intent,
-            super::mutation::MutationIntent::RestoreNote { .. }
-        ) || request.expected_revision.is_none()
-        {
-            return Err(DomainError::InvalidInput(
-                "Restore requires a snapshot and an explicit absence/tombstone revision".into(),
-            ));
-        }
-        super::mutation::NoteService::mutate_checked(scope, request, actor, authorize)
-    }
+    #[cfg(test)]
     pub fn list(scope: &ProfileScope, note_id: &str) -> Result<Vec<NoteVersion>, DomainError> {
         scope.transaction(|p| Self::list_locked(p, note_id))
     }

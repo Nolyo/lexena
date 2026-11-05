@@ -86,12 +86,15 @@ impl RevisionStore {
         }
         Ok(state)
     }
+    #[cfg(test)]
     pub fn note(scope: &ProfileScope, id: &str) -> Result<Revision, DomainError> {
         scope.transaction(|p| Self::note_locked(p, id))
     }
+    #[cfg(test)]
     pub fn folder(scope: &ProfileScope, id: &str) -> Result<Revision, DomainError> {
         scope.transaction(|p| Self::folder_locked(p, id))
     }
+    #[cfg(test)]
     pub fn collection(scope: &ProfileScope) -> Result<Revision, DomainError> {
         scope.transaction(|p| Self::collection_locked(p))
     }

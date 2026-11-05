@@ -38,13 +38,6 @@ pub(crate) fn is_valid_note_id(id: &str) -> bool {
         })
 }
 
-/// True when the note exists on disk for the active profile.
-pub(crate) fn note_exists(app_handle: &AppHandle, id: &str) -> bool {
-    ProfileScope::active(app_handle)
-        .and_then(|s| NoteRepository::get(&s, id))
-        .is_ok()
-}
-
 /// Read note metadata from a note directory
 
 /// Strip HTML tags for search purposes

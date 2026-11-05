@@ -1,47 +1,9 @@
 //! Capability checks are repeated for every invocation, including hidden tools.
-use super::connections::{GrantStore, Scope, SessionActor};
-use lexena_mcp_ipc::{Error, Result};
-
 /// The caller refreshes this list from the authoritative profiles manifest.
 #[derive(Clone)]
 pub struct ProfileIdentity {
     pub id: String,
-    pub name: String,
     pub created_at: String,
-}
-#[derive(Clone)]
-pub struct AuthorizedProfile {
-    pub id: String,
-    pub name: String,
-    actor: SessionActor,
-    scope: Scope,
-}
-impl AuthorizedProfile {
-    pub fn revalidate(&self, store: &GrantStore, profiles: &[ProfileIdentity]) -> Result<()> {
-        authorize(store, self.actor, profiles, &self.id, self.scope).map(|_| ())
-    }
-}
-pub fn authorize(
-    store: &GrantStore,
-    actor: SessionActor,
-    profiles: &[ProfileIdentity],
-    profile_id: &str,
-    scope: Scope,
-) -> Result<AuthorizedProfile> {
-    // Preview/read-entry helper only. Commits must retain the grant lease inside
-    // the already-held profile transaction, rather than caching this result.
-    let profile = profiles
-        .iter()
-        .find(|p| p.id == profile_id)
-        .ok_or(Error::Denied)?;
-    store.with_authorization(&actor, &profile.id, &profile.created_at, &[scope], |_| {
-        AuthorizedProfile {
-            id: profile.id.clone(),
-            name: profile.name.clone(),
-            actor,
-            scope,
-        }
-    })
 }
 pub fn admin_caller_allowed(
     label: &str,
@@ -60,6 +22,39 @@ pub fn admin_caller_allowed(
 mod tests {
     use super::*;
     use crate::mcp::connections::*;
+    use lexena_mcp_ipc::{Error, Result};
+
+    // Test fixture for issued previews. Production reads and commits keep the
+    // grant lease inside their profile transaction instead of caching a preview.
+    struct AuthorizedProfile {
+        id: String,
+        actor: SessionActor,
+        scope: Scope,
+    }
+    impl AuthorizedProfile {
+        fn revalidate(&self, store: &GrantStore, profiles: &[ProfileIdentity]) -> Result<()> {
+            authorize(store, self.actor, profiles, &self.id, self.scope).map(|_| ())
+        }
+    }
+    fn authorize(
+        store: &GrantStore,
+        actor: SessionActor,
+        profiles: &[ProfileIdentity],
+        profile_id: &str,
+        scope: Scope,
+    ) -> Result<AuthorizedProfile> {
+        let profile = profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .ok_or(Error::Denied)?;
+        store.with_authorization(&actor, &profile.id, &profile.created_at, &[scope], |_| {
+            AuthorizedProfile {
+                id: profile.id.clone(),
+                actor,
+                scope,
+            }
+        })
+    }
     fn session(store: &GrantStore, grant: &ConnectionGrant) -> SessionActor {
         SessionActor::authenticated(
             store.snapshot().unwrap().installation_id,
@@ -81,12 +76,10 @@ mod tests {
         let profiles = vec![
             ProfileIdentity {
                 id: "work".into(),
-                name: "Work".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
             },
             ProfileIdentity {
                 id: "personal".into(),
-                name: "Secret".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
             },
         ];
@@ -99,8 +92,8 @@ mod tests {
                 Scope::NotesRead
             )
             .unwrap()
-            .name,
-            "Work"
+            .id,
+            "work"
         );
         assert!(authorize(
             &store,
@@ -139,7 +132,6 @@ mod tests {
             .unwrap();
         let profiles = vec![ProfileIdentity {
             id: "default".into(),
-            name: "Default".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
         }];
         let authorized = authorize(
@@ -215,7 +207,6 @@ mod tests {
             .unwrap();
         let original = vec![ProfileIdentity {
             id: "work".into(),
-            name: "Work".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
         }];
         assert!(authorize(
@@ -229,7 +220,6 @@ mod tests {
         // Crash between manifest deletion and remove_profile: old grant persists.
         let recreated = vec![ProfileIdentity {
             id: "work".into(),
-            name: "New work".into(),
             created_at: "2026-11-05T12:00:00Z".into(),
         }];
         assert!(authorize(

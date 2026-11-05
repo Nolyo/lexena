@@ -3,8 +3,7 @@ use crate::note_service::editors::ProfileSession;
 pub use crate::note_service::repository::FolderMeta;
 #[cfg(test)]
 use crate::note_service::repository::{
-    is_folder_active, migrate_folder_orders_if_needed, migrate_folder_updated_at_if_needed,
-    normalize_icon,
+    is_folder_active, migrate_folder_updated_at_if_needed, normalize_icon,
 };
 use crate::note_service::{
     Actor, FolderRepository, MutationIntent, MutationResult, ProfileScope,

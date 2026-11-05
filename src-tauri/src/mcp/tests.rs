@@ -870,7 +870,6 @@ async fn release_bridge_sdk_pipe_disk_roundtrip() {
                     format!("synthetic {number}"),
                     vec![super::permissions::ProfileIdentity {
                         id: "perso".into(),
-                        name: "Synthetic".into(),
                         created_at: "2026-01-01T00:00:00Z".into(),
                     }],
                     all(),
