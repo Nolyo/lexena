@@ -276,3 +276,7 @@ Ces références étayent les mécanismes ; les limites et politiques produit so
 - [Tauri — binaires externes](https://v2.tauri.app/develop/sidecar/) : packaging par target du programme de liaison ; celui-ci est lancé par le client IA, pas par un outil shell du frontend.
 
 Version MCP de référence actuelle : 2026-07-28. Évaluer une version publiée du SDK dans le spike, la verrouiller dans Cargo.lock et tester aussi la compatibilité 2025-11-25 annoncée par le SDK. Ne pas copier une dépendance flottante depuis la branche principale.
+
+## 13. Contrats figés par le lot 0
+
+Les choix SDK, cycles de vie MCP 2026-07-28/2025-11-25, framing IPC privé v1, dépendances, fixtures synthétiques et packaging sont détaillés dans [implementation-decisions.md](../../mcp/implementation-decisions.md). Le spike est jetable et ne remplace ni les protections du lot 5 ni la validation installateur du lot 9. Le protocole actuel utilise server/discover et les métadonnées par requête ; initialize reste propre à la compatibilité 2025-11-25.
