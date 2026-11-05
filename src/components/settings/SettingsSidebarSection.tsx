@@ -24,6 +24,7 @@ export function SettingsSidebarSection({
             <button
               key={item.id}
               type="button"
+              aria-current={isActive ? "page" : undefined}
               onClick={() => onSectionChange(item.id as SettingsSectionId)}
               title={t(item.titleKey)}
               className="flex items-center justify-center p-1 rounded-md transition-colors cursor-pointer hover:bg-accent"
@@ -49,6 +50,7 @@ export function SettingsSidebarSection({
           <button
             key={item.id}
             type="button"
+            aria-current={isActive ? "page" : undefined}
             onClick={() => onSectionChange(item.id as SettingsSectionId)}
             className={`w-full flex items-center gap-2.5 px-2 py-2 rounded-md text-left transition-colors cursor-pointer ${
               isActive

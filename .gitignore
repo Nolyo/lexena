@@ -29,6 +29,9 @@ src-tauri/private.key
 # Local release artifacts (built by release.ps1)
 artifacts/
 
+# Generated native MCP sidecars (built before Tauri bundling)
+/src-tauri/binaries/lexena-mcp-*
+
 # Auto Claude data directory
 .auto-claude/
 .mcp.json
@@ -38,6 +41,9 @@ artifacts/
 AGENTS.md
 
 .design-handoff/
+
+# Local implementation ledgers and test output
+.superpowers/
 
 # Auto Claude generated files
 .auto-claude-security.json

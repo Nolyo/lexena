@@ -6,6 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:desktop": "pnpm mcp:bridge:build && pnpm build",
+    "mcp:bridge:build": "node scripts/build-mcp-bridge.mjs",
+    "mcp:packaging:check": "node scripts/build-mcp-bridge.mjs --check",
+    "test:mcp-packaging": "node --test scripts/build-mcp-bridge.test.mjs scripts/scan-mcp-packaging.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",

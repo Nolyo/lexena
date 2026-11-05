@@ -1,189 +1,72 @@
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
+use crate::commands::note_editors::mutate_ui;
+use crate::note_service::editors::ProfileSession;
+pub use crate::note_service::repository::FolderMeta;
+#[cfg(test)]
+use crate::note_service::repository::{
+    is_folder_active, migrate_folder_updated_at_if_needed, normalize_icon,
+};
+use crate::note_service::{
+    Actor, FolderRepository, MutationIntent, MutationResult, ProfileScope,
+};
 use tauri::AppHandle;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FolderMeta {
-    pub id: String,
-    pub name: String,
-    /// Emoji icon shown instead of the default folder glyph. `None` = default
-    /// glyph. Synced through the cloud row (same LWW timestamp as the name).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub icon: Option<String>,
-    pub created_at: String,
-    /// Last-write-wins timestamp for sync. Migrated from `created_at` on first
-    /// read when missing (see [`migrate_folder_updated_at_if_needed`]).
-    #[serde(default)]
-    pub updated_at: String,
-    #[serde(default)]
-    pub order: i32,
-    /// Soft-delete tombstone. `None` = active folder; `Some(rfc3339)` = deleted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deleted_at: Option<String>,
-}
+use tauri::WebviewWindow;
 
 /// Pure helper: a folder is "active" (visible to the user) when it has not been
 /// soft-deleted. Mirrors `notes::is_note_active`.
-fn is_folder_active(folder: &FolderMeta) -> bool {
-    folder.deleted_at.is_none()
-}
 
 /// Pure helper: trims the icon, maps empty/whitespace-only to `None`, and
 /// rejects anything longer than 32 UTF-16 units (the sync-push Edge cap —
 /// a longer icon would 400 the whole push batch).
-fn normalize_icon(icon: Option<String>) -> Option<String> {
-    icon.and_then(|s| {
-        let trimmed = s.trim();
-        // Mirror the sync-push cap (max 32 UTF-16 units): an over-long icon
-        // would 400 the whole push batch, so it must never be persisted.
-        if trimmed.is_empty() || trimmed.encode_utf16().count() > 32 {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-fn get_folders_file(app_handle: &AppHandle) -> Result<PathBuf> {
-    let profile_dir = crate::profiles::get_active_profile_dir(app_handle)
-        .context("Could not resolve active profile directory")?;
-    let notes_dir = profile_dir.join("notes");
-    if !notes_dir.exists() {
-        fs::create_dir_all(&notes_dir)
-            .with_context(|| format!("Failed to create notes directory: {}", notes_dir.display()))?;
-    }
-    Ok(notes_dir.join("folders.json"))
-}
-
-fn read_folders(app_handle: &AppHandle) -> Result<Vec<FolderMeta>> {
-    let path = get_folders_file(app_handle)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    if content.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let folders: Vec<FolderMeta> =
-        serde_json::from_str(&content).with_context(|| "Failed to parse folders.json")?;
-    Ok(folders)
-}
-
-fn write_folders(app_handle: &AppHandle, folders: &[FolderMeta]) -> Result<()> {
-    let path = get_folders_file(app_handle)?;
-    let json = serde_json::to_string_pretty(folders)?;
-    fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
-}
 
 /// If all folders have order == 0 (i.e. field was defaulted on deserialize),
 /// assign orders from the current alphabetical sort. Returns true if migrated.
-fn migrate_folder_orders_if_needed(folders: &mut Vec<FolderMeta>) -> bool {
-    if folders.len() < 2 {
-        return false;
-    }
-    if !folders.iter().all(|f| f.order == 0) {
-        return false;
-    }
-    folders.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    for (idx, folder) in folders.iter_mut().enumerate() {
-        folder.order = idx as i32;
-    }
-    true
-}
 
 /// Backfill `updated_at` from `created_at` for legacy folders persisted before
 /// the field existed. Returns true if at least one folder was migrated.
-fn migrate_folder_updated_at_if_needed(folders: &mut Vec<FolderMeta>) -> bool {
-    let mut migrated = false;
-    for folder in folders.iter_mut() {
-        if folder.updated_at.is_empty() {
-            folder.updated_at = folder.created_at.clone();
-            migrated = true;
-        }
-    }
-    migrated
-}
 
 #[tauri::command]
 pub async fn list_folders(app_handle: AppHandle) -> Result<Vec<FolderMeta>, String> {
-    let mut folders = read_folders(&app_handle).map_err(|e| e.to_string())?;
-    let orders_migrated = migrate_folder_orders_if_needed(&mut folders);
-    let updated_at_migrated = migrate_folder_updated_at_if_needed(&mut folders);
-    if orders_migrated || updated_at_migrated {
-        write_folders(&app_handle, &folders).map_err(|e| e.to_string())?;
-    }
-    folders.retain(is_folder_active);
-    folders.sort_by(|a, b| {
-        a.order
-            .cmp(&b.order)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    Ok(folders)
+    let scope = ProfileScope::active(&app_handle).map_err(|e| e.to_string())?;
+    FolderRepository::list(&scope).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn create_folder(
     app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
     name: String,
     icon: Option<String>,
 ) -> Result<FolderMeta, String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("Folder name cannot be empty".to_string());
-    }
-
-    let mut folders = read_folders(&app_handle).map_err(|e| e.to_string())?;
-    migrate_folder_orders_if_needed(&mut folders);
-
-    let next_order = folders.iter().map(|f| f.order).max().unwrap_or(-1) + 1;
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let meta = FolderMeta {
-        id: uuid::Uuid::new_v4().to_string(),
-        name: trimmed.to_string(),
-        icon: normalize_icon(icon),
-        created_at: now.clone(),
-        updated_at: now,
-        order: next_order,
-        deleted_at: None,
-    };
-
-    folders.push(meta.clone());
-    write_folders(&app_handle, &folders).map_err(|e| e.to_string())?;
-
-    Ok(meta)
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::CreateFolder { name, icon },
+        Actor::Ui,
+    )
+    .await
+    .and_then(MutationResult::folder)
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn reorder_folders(app_handle: AppHandle, ids: Vec<String>) -> Result<(), String> {
-    let mut folders = read_folders(&app_handle).map_err(|e| e.to_string())?;
-
-    let id_to_index: std::collections::HashMap<String, usize> =
-        ids.into_iter().enumerate().map(|(i, id)| (id, i)).collect();
-
-    let now = chrono::Utc::now().to_rfc3339();
-
-    // Folders not in the input list keep a stable position after the reordered ones.
-    let mut max_ordered = id_to_index.len() as i32;
-    for folder in folders.iter_mut() {
-        if let Some(&idx) = id_to_index.get(&folder.id) {
-            folder.order = idx as i32;
-            // Bulk reorder is a coupled mutation: bump every folder explicitly
-            // listed in the input so LWW sync picks up the new ordering.
-            folder.updated_at = now.clone();
-        } else {
-            folder.order = max_ordered;
-            max_ordered += 1;
-        }
-    }
-
-    write_folders(&app_handle, &folders).map_err(|e| e.to_string())?;
-    Ok(())
+pub async fn reorder_folders(
+    app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
+    ids: Vec<String>,
+) -> Result<(), String> {
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::ReorderFolders { ids },
+        Actor::Ui,
+    )
+    .await
+    .and_then(MutationResult::unit)
+    .map_err(|e| e.to_string())
 }
 
 /// Rename a folder and set its emoji icon in one atomic write.
@@ -193,53 +76,41 @@ pub async fn reorder_folders(app_handle: AppHandle, ids: Vec<String>) -> Result<
 #[tauri::command]
 pub async fn rename_folder(
     app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
     id: String,
     name: String,
     icon: Option<String>,
 ) -> Result<FolderMeta, String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("Folder name cannot be empty".to_string());
-    }
-
-    let mut folders = read_folders(&app_handle).map_err(|e| e.to_string())?;
-
-    let folder = folders
-        .iter_mut()
-        .find(|f| f.id == id)
-        .ok_or_else(|| format!("Folder not found: {}", id))?;
-    folder.name = trimmed.to_string();
-    folder.icon = normalize_icon(icon);
-    folder.updated_at = chrono::Utc::now().to_rfc3339();
-    let updated = folder.clone();
-
-    write_folders(&app_handle, &folders).map_err(|e| e.to_string())?;
-
-    Ok(updated)
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::RenameFolder { id, name, icon },
+        Actor::Ui,
+    )
+    .await
+    .and_then(MutationResult::folder)
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn delete_folder(app_handle: AppHandle, id: String) -> Result<(), String> {
-    let mut folders = read_folders(&app_handle).map_err(|e| e.to_string())?;
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut found = false;
-    for folder in folders.iter_mut() {
-        if folder.id == id {
-            folder.deleted_at = Some(now.clone());
-            folder.updated_at = now.clone();
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        return Ok(());
-    }
-    write_folders(&app_handle, &folders).map_err(|e| e.to_string())?;
-
-    // Existing semantics: notes in this folder become orphans (folder_id reset to None).
-    crate::notes::orphan_notes_in_folder(&app_handle, &id).map_err(|e| e.to_string())?;
-
-    Ok(())
+pub async fn delete_folder(
+    app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
+    id: String,
+) -> Result<(), String> {
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::DeleteFolder { id },
+        Actor::Ui,
+    )
+    .await
+    .and_then(MutationResult::unit)
+    .map_err(|e| e.to_string())
 }
 
 /// Imports folders for backup restore. Replaces the local folders.json entirely
@@ -247,10 +118,21 @@ pub async fn delete_folder(app_handle: AppHandle, id: String) -> Result<(), Stri
 #[tauri::command]
 pub async fn import_folders_for_backup(
     app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
     folders: Vec<FolderMeta>,
+    source: Option<crate::note_service::mutation::ImportSource>,
 ) -> Result<(), String> {
-    write_folders(&app_handle, &folders).map_err(|e| e.to_string())?;
-    Ok(())
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::ImportFolders { folders },
+        source.unwrap_or_default().into(),
+    )
+    .await
+    .and_then(MutationResult::unit)
+    .map_err(|e| e.to_string())
 }
 
 /// Hard-delete soft-deleted folders after server confirmed they were purged.
@@ -259,19 +141,20 @@ pub async fn import_folders_for_backup(
 #[tauri::command]
 pub async fn purge_soft_deleted_folders_post_pull(
     app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
     folder_ids: Vec<String>,
 ) -> Result<u32, String> {
-    if folder_ids.is_empty() {
-        return Ok(0);
-    }
-    let mut folders = read_folders(&app_handle).map_err(|e| e.to_string())?;
-    let before = folders.len();
-    folders.retain(|f| !(folder_ids.contains(&f.id) && f.deleted_at.is_some()));
-    let purged = (before - folders.len()) as u32;
-    if purged > 0 {
-        write_folders(&app_handle, &folders).map_err(|e| e.to_string())?;
-    }
-    Ok(purged)
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::PurgeFolders { folder_ids },
+        Actor::Remote,
+    )
+    .await
+    .and_then(MutationResult::count)
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -426,27 +309,48 @@ mod tests {
 
         assert_eq!(restored[1].id, "tombstoned-1");
         assert_eq!(restored[1].name, "Old");
-        assert_eq!(restored[1].deleted_at, Some("2026-05-19T12:00:00Z".to_string()));
+        assert_eq!(
+            restored[1].deleted_at,
+            Some("2026-05-19T12:00:00Z".to_string())
+        );
         assert_eq!(restored[1].icon, None);
-        assert!(!is_folder_active(&restored[1]), "tombstone must survive restore");
+        assert!(
+            !is_folder_active(&restored[1]),
+            "tombstone must survive restore"
+        );
     }
 
     #[test]
     fn purge_post_pull_retain_only_drops_tombstoned_in_target_set() {
         // Mirror the retain() predicate from purge_soft_deleted_folders_post_pull.
         let mut folders = vec![
-            FolderMeta { id: "active-1".to_string(), name: "A".to_string(),
+            FolderMeta {
+                id: "active-1".to_string(),
+                name: "A".to_string(),
                 created_at: "2026-05-19T10:00:00Z".to_string(),
                 updated_at: "2026-05-19T10:00:00Z".to_string(),
-                order: 0, deleted_at: None, icon: None },
-            FolderMeta { id: "tombstoned-1".to_string(), name: "B".to_string(),
+                order: 0,
+                deleted_at: None,
+                icon: None,
+            },
+            FolderMeta {
+                id: "tombstoned-1".to_string(),
+                name: "B".to_string(),
                 created_at: "2026-05-19T10:00:00Z".to_string(),
                 updated_at: "2026-05-19T11:00:00Z".to_string(),
-                order: 1, deleted_at: Some("2026-05-19T11:00:00Z".to_string()), icon: None },
-            FolderMeta { id: "tombstoned-not-in-target".to_string(), name: "C".to_string(),
+                order: 1,
+                deleted_at: Some("2026-05-19T11:00:00Z".to_string()),
+                icon: None,
+            },
+            FolderMeta {
+                id: "tombstoned-not-in-target".to_string(),
+                name: "C".to_string(),
                 created_at: "2026-05-19T10:00:00Z".to_string(),
                 updated_at: "2026-05-19T11:00:00Z".to_string(),
-                order: 2, deleted_at: Some("2026-05-19T11:00:00Z".to_string()), icon: None },
+                order: 2,
+                deleted_at: Some("2026-05-19T11:00:00Z".to_string()),
+                icon: None,
+            },
         ];
         let target_ids = vec!["active-1".to_string(), "tombstoned-1".to_string()];
         folders.retain(|f| !(target_ids.contains(&f.id) && f.deleted_at.is_some()));
@@ -499,7 +403,10 @@ mod tests {
         assert_eq!(normalize_icon(None), None);
         assert_eq!(normalize_icon(Some("".to_string())), None);
         assert_eq!(normalize_icon(Some("   ".to_string())), None);
-        assert_eq!(normalize_icon(Some(" 📁 ".to_string())), Some("📁".to_string()));
+        assert_eq!(
+            normalize_icon(Some(" 📁 ".to_string())),
+            Some("📁".to_string())
+        );
     }
 
     #[test]

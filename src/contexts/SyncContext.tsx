@@ -9,19 +9,19 @@ import {
 } from "react";
 import { Store } from "@tauri-apps/plugin-store";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAuth } from "@/hooks/useAuth";
 import { useSettings } from "@/hooks/useSettings";
 import {
   extractCloudSettings,
-  mapFolderToCloud,
-  mapNoteToCloud,
   syncableSettingsChanged,
 } from "@/lib/sync/mapping";
 import { flog } from "@/lib/flog";
 import { pullAll, pushOperations } from "@/lib/sync/client";
 import {
   enqueue,
+  enqueueWithId,
   peekAll,
   peekReadyHead,
   markRetry,
@@ -29,7 +29,11 @@ import {
   getDeadLetters,
   MAX_RETRIES_BEFORE_DLQ,
   size as queueSize,
+  getQueueSession,
+  loadSnapshot,
 } from "@/lib/sync/queue";
+import { drainLocalOutbox, protectedEntityKeys } from "@/lib/sync/local-outbox";
+import { nextDependencyBatch } from "@/lib/sync/push-dependencies";
 import { applyBatchResults } from "@/lib/sync/apply-batch-results";
 import {
   loadSnippets,
@@ -39,13 +43,10 @@ import {
 import {
   applyRemoteNote,
   flushPendingNoteUpdates,
-  listNotes,
-  readNote,
   scanOversizedNoteCount,
 } from "@/lib/sync/notes-store";
-import { isNoteSyncable } from "@/lib/sync/note-size";
-import { shouldPushNote } from "@/lib/sync/note-push-gate";
 import { applyRemoteFolder, listFolders } from "@/lib/sync/folders-store";
+import { applyContentInDependencyOrder, normalizePulledNoteFolders } from "@/lib/sync/apply-content";
 import {
   loadDictionary,
   applyRemoteWord,
@@ -53,7 +54,7 @@ import {
 } from "@/lib/sync/dictionary-store";
 import { mergeSettingsLWW, shouldApplyCloudSettings } from "@/lib/sync/merge";
 import { computeNextPullCursor } from "@/lib/sync/pull-cursor";
-import { setSyncActive } from "@/lib/sync/sync-gate";
+import { isSyncActive, setSyncActive } from "@/lib/sync/sync-gate";
 import { ensureCloudProfileId } from "@/lib/sync/cloud-profile";
 import type { AppSettings } from "@/lib/settings";
 import type { SyncOperation, SyncState, SyncStatus } from "@/lib/sync/types";
@@ -97,7 +98,8 @@ let metaStorePromise: Promise<Awaited<ReturnType<typeof Store.load>>> | null = n
 async function getMetaStore() {
   if (!metaStorePromise) {
     metaStorePromise = (async () => {
-      const path = await invoke<string>("get_active_profile_sync_meta_path");
+      const session = await getQueueSession();
+      const path = await invoke<string>("get_profile_sync_meta_path", { id: session.profile_id });
       return Store.load(path);
     })();
   }
@@ -128,6 +130,8 @@ export function SyncProvider({ children }: { children: ReactNode }) {
   const debounceRef = useRef<number | null>(null);
   const flushingRef = useRef(false);
   const pushingRef = useRef(false);
+  const pullingRef = useRef(false);
+  const pullAgainRef = useRef(false);
   // Always-fresh mirror so stable callbacks (flush, pullAndApply, notify*) can
   // read the latest settings without re-subscribing on every settings change.
   const settingsRef = useRef<AppSettings["settings"]>(settings);
@@ -159,25 +163,34 @@ export function SyncProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const flushQueue = useCallback(async () => {
-    if (flushingRef.current) return;
+    if (flushingRef.current || !isSyncActive() || auth.status !== "signed-in") return false;
     flushingRef.current = true;
     setStatus("syncing");
     try {
       const deviceId = await getDeviceId();
-      const { id: cloudProfileId } = await ensureCloudProfileId(getMeta, setMeta);
+      const session = await getQueueSession();
+      await drainLocalOutbox(session.profile_id);
+      const { id: cloudProfileId, name } = await ensureCloudProfileId(getMeta, setMeta, session.profile_id);
+      if ([...await peekAll(), ...await getDeadLetters()].some(e => e.operation.kind === "profile-delete" && e.operation.id === cloudProfileId)) return false;
+      // Put parent confirmation through the same durable retry/DLQ flow. Its
+      // dependency phase is sent alone, and failure blocks folders and notes.
+      if ((await peekAll()).length > 0) await enqueueWithId(`profile-parent:${cloudProfileId}`, { kind: "profile-upsert", profile: { id: cloudProfileId, name, updated_at: new Date().toISOString(), deleted_at: null } });
       let sawError = false;
       // eslint-disable-next-line no-constant-condition
       while (true) {
-        const ready = await peekReadyHead();
-        if (!ready) break;
+        if (!isSyncActive()) break;
+        await drainLocalOutbox(session.profile_id);
         const pending = await peekAll();
-        const batch = pending.slice(0, 50);
+        const blockedFolders = new Set((await loadSnapshot()).protectedEntities?.filter(e => e.kind === "folder").map(e => e.id) ?? []);
+        const batch = nextDependencyBatch(pending, await getDeadLetters(), Date.now(), blockedFolders);
+        if (!batch.length) break;
+        const ready = batch[0];
         const ops = batch.map((e) => e.operation);
         const resp = await pushOperations(ops, deviceId, cloudProfileId);
         if (!resp.ok) {
           // Whole-batch failure (network, 5xx, 413 quota)
           await markRetry(ready.id, resp.error ?? "push failed");
-          const updated = (await peekAll())[0];
+          const updated = (await peekAll()).find(e => e.id === ready.id);
           if (
             updated &&
             updated.id === ready.id &&
@@ -220,13 +233,18 @@ export function SyncProvider({ children }: { children: ReactNode }) {
       setPendingCount(await queueSize());
       await refreshDeadLetterCount();
       if (!sawError) {
-        setStatus("idle");
+        setStatus(isSyncActive() ? "idle" : "disabled");
         setLastError(null);
       }
+      return !sawError && isSyncActive();
+    } catch (error) {
+      setStatus("error");
+      setLastError(String(error));
+      return false;
     } finally {
       flushingRef.current = false;
     }
-  }, [getDeviceId, refreshDeadLetterCount]);
+  }, [auth.status, getDeviceId, refreshDeadLetterCount]);
 
   const enqueueAndTry = useCallback(
     async (op: SyncOperation) => {
@@ -238,15 +256,23 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     [enabled, flushQueue]
   );
 
-  const pullAndApply = useCallback(async (opts?: { forceFull?: boolean }) => {
+  const pullAndApply = useCallback(async (opts?: { forceFull?: boolean }): Promise<void> => {
     // `forceFull` is used by enableSync: it bypasses the stale `enabled` closure
     // (enableSync sets enabled=true but this callback still captured false) AND
     // ignores any residual cursor, so activating sync always does a COMPLETE
     // reconcile instead of an incremental pull that would miss older notes.
-    if ((!enabled && !opts?.forceFull) || auth.status !== "signed-in") return;
+    if ((!enabled && !opts?.forceFull) || !isSyncActive() || auth.status !== "signed-in") return;
+    // One application/purge pipeline at a time: an older in-flight response
+    // must not arrive after a later response has purged its local tombstone.
+    if (pullingRef.current) { pullAgainRef.current = true; return; }
+    pullingRef.current = true;
     setStatus("syncing");
     try {
-      const since = opts?.forceFull
+      const session = await getQueueSession();
+      await drainLocalOutbox(session.profile_id);
+      const protectedKeys = await protectedEntityKeys();
+      let deferred = false;
+      const since = opts?.forceFull || protectedKeys.size > 0
         ? null
         : await getMeta<string | null>(KEY_LAST_PULL_AT, null);
       const cloudProfileId = await getMeta<string | null>(KEY_CLOUD_PROFILE_ID, null);
@@ -256,6 +282,7 @@ export function SyncProvider({ children }: { children: ReactNode }) {
         return;
       }
       const result = await pullAll(since, cloudProfileId);
+      if (!isSyncActive()) return;
 
       // Settings : LWW → écrire la diff syncable dans le SettingsContext
       if (result.settings) {
@@ -312,27 +339,15 @@ export function SyncProvider({ children }: { children: ReactNode }) {
         });
       }
 
-      // Notes — LWW per item. Per-row try/catch so a single bad row (corrupted
-      // local file, fs permission, etc.) does NOT abort the whole batch.
-      for (const row of result.notes) {
-        try {
-          await applyRemoteNote(row);
-        } catch (e) {
-          flog(`[sync] applyRemoteNote failed for ${row.id}: ${String(e)}`, "warn");
-        }
-      }
-
-      // Folders — LWW per item, same per-row isolation.
-      for (const row of result.folders) {
-        try {
-          await applyRemoteFolder(row);
-        } catch (e) {
-          flog(
-            `[sync] applyRemoteFolder failed for ${row.id}: ${String(e)}`,
-            "warn"
-          );
-        }
-      }
+      // Parent folders must exist before notes are imported on a fresh profile.
+      // Retain per-row isolation so a corrupt item cannot abort the whole pull.
+      await applyContentInDependencyOrder(
+        result.folders, result.notes,
+        async row => { if (!isSyncActive() || protectedKeys.has(`folder:${row.id}`)) { deferred = true; return; } const result = await applyRemoteFolder(row); deferred ||= result.deferred; },
+        async row => { if (!isSyncActive() || protectedKeys.has(`note:${row.id}`)) { deferred = true; return; } const result = await applyRemoteNote(row); deferred ||= result.deferred; },
+        (kind, id, error) => { deferred = true; flog(`[sync] applyRemote ${kind} failed for ${id}: ${String(error)}`, "warn"); },
+        async (notes) => normalizePulledNoteFolders(result.folders, notes, new Set((await listFolders()).map((folder) => folder.id))),
+      );
 
       // Hard-purge local tombstones the server has also tombstoned.
       // The server purges tombstones >30d via cron (sub-épique 03 Task 7).
@@ -340,70 +355,38 @@ export function SyncProvider({ children }: { children: ReactNode }) {
       // for ids the server confirms are tombstoned. The Rust commands only
       // act on entries that ARE locally soft-deleted, so passing all
       // server-tombstoned ids regardless of age is safe and convergent.
-      const tombstonedNoteIds = result.notes
-        .filter((n) => n.deleted_at !== null)
-        .map((n) => n.id);
-      if (tombstonedNoteIds.length > 0) {
-        try {
-          await invoke<number>("purge_soft_deleted_notes_post_pull", {
-            noteIds: tombstonedNoteIds,
-          });
-        } catch (e) {
-          flog(
-            `[sync] purge_soft_deleted_notes_post_pull failed: ${String(e)}`,
-            "warn"
-          );
-        }
-      }
-
-      const tombstonedFolderIds = result.folders
-        .filter((f) => f.deleted_at !== null)
-        .map((f) => f.id);
-      if (tombstonedFolderIds.length > 0) {
-        try {
-          await invoke<number>("purge_soft_deleted_folders_post_pull", {
-            folderIds: tombstonedFolderIds,
-          });
-        } catch (e) {
-          flog(
-            `[sync] purge_soft_deleted_folders_post_pull failed: ${String(e)}`,
-            "warn"
-          );
-        }
-      }
+      if (!isSyncActive()) return;
+      const purgeDeferred = await invoke<boolean>("purge_sync_tombstones", {
+        session,
+        noteIds: result.notes.filter(n => n.deleted_at !== null && !protectedKeys.has(`note:${n.id}`)).map(n => n.id),
+        folderIds: result.folders.filter(f => f.deleted_at !== null && !protectedKeys.has(`folder:${f.id}`)).map(f => f.id),
+      });
+      deferred ||= purgeDeferred;
 
       // Cursor for the next incremental pull MUST come from server `updated_at`
       // values, never the client wall-clock — a client clock ahead of the server
       // would push the cursor past rows written on another device and hide them
       // permanently. Display timestamps below stay wall-clock (cosmetic only).
-      const nextCursor = computeNextPullCursor(since, result);
+      const nextCursor = deferred ? null : computeNextPullCursor(since, result);
       await setMeta(KEY_LAST_PULL_AT, nextCursor);
       const nowIso = new Date().toISOString();
       setLastPullAt(nowIso);
       setLastSyncAt(nowIso);
-      setStatus("idle");
-      setLastError(null);
+      const unresolved = [...await peekAll(), ...await getDeadLetters()];
+      const failed = unresolved.find(entry => entry.last_error !== null);
+      if (failed) { setStatus(current => current === "quota-exceeded" ? current : "error"); setLastError(failed.last_error); }
+      else if (unresolved.length === 0) { setStatus("idle"); setLastError(null); }
     } catch (e: unknown) {
       setStatus("error");
       setLastError(e instanceof Error ? e.message : String(e));
+    } finally {
+      pullingRef.current = false;
+      if (pullAgainRef.current) { pullAgainRef.current = false; void pullAndApply({ forceFull: true }); }
     }
   }, [enabled, auth.status, updateSettings]);
 
-  /**
-   * Push the COMPLETE local state of the active profile to the cloud:
-   * profile + settings + dictionary + snippets + folders + notes. Idempotent
-   * (all upserts), so it's safe to re-run — used both at activation and as a
-   * recovery retry on mount / manual "sync now".
-   *
-   * ORDRE CRITIQUE — folders DOIVENT précéder notes dans le tableau d'ops.
-   * Le sync-push Edge traite les ops séquentiellement (boucle for index), et
-   * `user_notes.folder_id` a une FK vers `user_folders.id`. Sans cet ordre,
-   * toute note avec folder_id non null déclenche une violation FK
-   * (user_notes_folder_id_fkey).
-   *
-   * Returns true on full success (all ops accepted). On success it records
-   * `initial_push_done` so mount stops retrying.
-   */
+  /** Push preferences and seed legacy content once. Note/folder payloads always
+   * come from the current-state native outbox and use confirmed queue phases. */
   const fullPush = useCallback(async (): Promise<boolean> => {
     // Prevent a concurrent second full push (e.g. activation + mount retry
     // firing together). Idempotent upserts make a double push harmless, but
@@ -412,8 +395,9 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     pushingRef.current = true;
     setStatus("syncing");
     try {
+      const session = await getQueueSession();
       const { id: cloudProfileId, name: cloudProfileName } =
-        await ensureCloudProfileId(getMeta, setMeta);
+        await ensureCloudProfileId(getMeta, setMeta, session.profile_id);
       const deviceId = await getDeviceId();
       const ops: SyncOperation[] = [];
       ops.push({
@@ -448,68 +432,22 @@ export function SyncProvider({ children }: { children: ReactNode }) {
         });
       }
 
-      // Folders actifs — AVANT les notes (FK user_notes_folder_id_fkey).
-      const folders = await listFolders();
-      for (const f of folders) {
-        if (f.deletedAt) continue;
-        ops.push({ kind: "folder-upsert", folder: mapFolderToCloud(f) });
-      }
-
-      // Notes actives — après les folders. Lecture du contenu par note.
-      // Une note > 1 MB (UTF-8) ne peut PAS être synchronisée : le serveur
-      // valide le body du push de façon atomique, donc une seule note trop
-      // grosse fait échouer TOUT le batch ("invalid body") et bloque
-      // silencieusement toutes les autres ops. On les saute ici (elles
-      // restent locales) et on les compte pour avertir l'utilisateur.
-      const notesMeta = await listNotes();
-      let oversized = 0;
-      const initialDone = await getMeta<boolean>(KEY_INITIAL_PUSH_DONE, false);
-      for (const nm of notesMeta) {
-        if (nm.deletedAt) continue;
-        if (nm.localOnly) {
-          // Local-only notes never leave the device. On the INITIAL push only,
-          // re-assert the opt-out: a toggle made while sync was disabled never
-          // enqueued its note-delete, and re-enabling resets initial_push_done
-          // so this run covers it (a toggle while sync was active but offline
-          // is already in the persistent queue). note-delete is a scoped
-          // UPDATE — a harmless no-op for notes that never reached the cloud.
-          // Post-initial runs must NOT re-send it: each delete re-stamps
-          // deleted_at server-side, which would reset the 30-day tombstone
-          // purge clock on every "Sync now".
-          if (!initialDone) ops.push({ kind: "note-delete", id: nm.id });
-          continue;
-        }
-        try {
-          const { content } = await readNote(nm.id);
-          if (!isNoteSyncable(content)) {
-            oversized++;
-            flog(
-              `[sync] note ${nm.id} ("${nm.title}") skipped (over sync size cap)`,
-              "warn"
-            );
-            continue;
-          }
-          // Empty notes have nothing to push (fresh create_note output).
-          if (!shouldPushNote(nm, content)) continue;
-          ops.push({ kind: "note-upsert", note: mapNoteToCloud(nm, content) });
-        } catch (e) {
-          flog(`[sync] readNote failed for ${nm.id}: ${String(e)}`, "warn");
-        }
-      }
-      setOversizedNoteCount(oversized);
+      await invoke("seed_local_sync_snapshot", { session });
+      await drainLocalOutbox(session.profile_id);
+      setOversizedNoteCount(await scanOversizedNoteCount());
 
       let pushFailed: string | null = null;
+      let quotaExceeded = false;
       if (ops.length > 0) {
-        // sync-push cap : max 200 ops par requête. Chunker en préservant
-        // l'ordre global (le tableau `ops` est déjà folders-avant-notes,
-        // donc chunker ne casse pas la garantie FK : tout folder est dans
-        // un chunk antérieur ou identique à toute note qui le référence).
+        // Confirm the profile alone, then honor the existing 200-op API cap.
         const CHUNK = 200;
         let lastServerTime: string | undefined;
-        for (let i = 0; i < ops.length; i += CHUNK) {
-          const chunk = ops.slice(i, i + CHUNK);
+        for (let i = 0; i < ops.length;) {
+          if (!isSyncActive()) return false;
+          const chunk = i === 0 ? ops.slice(0, 1) : ops.slice(i, i + CHUNK);
           const resp = await pushOperations(chunk, deviceId, cloudProfileId);
           if (!resp.ok) {
+            quotaExceeded = resp.status === 413;
             pushFailed = resp.error ?? "unknown";
             flog(
               `[sync] full push chunk ${Math.floor(i / CHUNK)} failed: ${pushFailed}`,
@@ -529,16 +467,19 @@ export function SyncProvider({ children }: { children: ReactNode }) {
             break;
           }
           if (resp.server_time) lastServerTime = resp.server_time;
+          i += chunk.length;
         }
         if (lastServerTime) {
           await setMeta(KEY_LAST_PUSHED_SETTINGS_AT, lastServerTime);
         }
       }
       if (pushFailed) {
-        setStatus("error");
+        setStatus(quotaExceeded ? "quota-exceeded" : "error");
         setLastError(pushFailed);
         return false;
       }
+      if (!await flushQueue()) return false;
+      if (await queueSize() > 0 || (await getDeadLetters()).length > 0) return false;
       await setMeta(KEY_INITIAL_PUSH_DONE, true);
       setStatus("idle");
       setLastError(null);
@@ -552,7 +493,7 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     } finally {
       pushingRef.current = false;
     }
-  }, [getDeviceId]);
+  }, [getDeviceId, flushQueue]);
 
   const enableSync = useCallback(async () => {
     await setMeta(KEY_ENABLED, true);
@@ -566,7 +507,7 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     // early-returns when the active profile has no cloud partition yet, so the
     // forceFull reconcile would be a no-op otherwise. fullPush re-ensures it
     // (idempotent: returns the same stored id).
-    await ensureCloudProfileId(getMeta, setMeta);
+    await ensureCloudProfileId(getMeta, setMeta, (await getQueueSession()).profile_id);
 
     // Legacy migration : importer settings.snippets / settings.dictionary si présents
     try {
@@ -577,14 +518,13 @@ export function SyncProvider({ children }: { children: ReactNode }) {
       flog(`[sync] legacy migration failed: ${String(e)}`, "warn");
     }
 
-    await pullAndApply({ forceFull: true });
     await fullPush();
+    await pullAndApply({ forceFull: true });
   }, [pullAndApply, fullPush]);
 
   const disableSync = useCallback(async () => {
-    // Task 19 : flush les notes en cours de debounce (push immédiat) avant de
-    // désactiver, sinon les modifs des 2 dernières secondes sont perdues si
-    // l'user se déconnecte juste après avoir tapé.
+    setSyncActive(false);
+    // Cancel pending wakeups; their actual intentions already live in Rust.
     try {
       await flushPendingNoteUpdates();
     } catch (e) {
@@ -605,11 +545,9 @@ export function SyncProvider({ children }: { children: ReactNode }) {
   const syncNow = useCallback(async () => {
     if (!enabled) return;
     await flushQueue();
-    // A manual "sync now" also re-asserts the full local state. This is the
-    // recovery path when the initial push failed (e.g. an oversized note that
-    // has since been trimmed): one click re-pushes everything, idempotently.
+    // Retry initial preferences/legacy seeding, then reconcile deferred rows.
     await fullPush();
-    await pullAndApply();
+    await pullAndApply({ forceFull: true });
   }, [enabled, flushQueue, fullPush, pullAndApply]);
 
   const notifySettingsChanged = useCallback(
@@ -681,8 +619,8 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     if (mountSyncRanRef.current) return;
     mountSyncRanRef.current = true;
     void (async () => {
-      await pullAndApply();
       await flushQueue();
+      await pullAndApply();
       const done = await getMeta<boolean>(KEY_INITIAL_PUSH_DONE, false);
       if (!done) await fullPush();
     })();
@@ -701,14 +639,31 @@ export function SyncProvider({ children }: { children: ReactNode }) {
 
   // Schedule a retry when the head's next_retry_at is past
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || auth.status !== "signed-in") return;
     const id = setInterval(async () => {
       if (flushingRef.current) return;
+      const session = await getQueueSession();
+      await drainLocalOutbox(session.profile_id);
       const ready = await peekReadyHead();
-      if (ready) void flushQueue();
+      if (ready) { await flushQueue(); await pullAndApply(); }
     }, 5_000);
     return () => clearInterval(id);
-  }, [enabled, flushQueue]);
+  }, [auth.status, enabled, flushQueue, pullAndApply]);
+
+  useEffect(() => {
+    if (!enabled || auth.status !== "signed-in") return;
+    const wake = () => { void (async () => { await flushQueue(); await pullAndApply(); })(); };
+    window.addEventListener("local-outbox-ready", wake);
+    let disposed = false;
+    const stops: (() => void)[] = [];
+    for (const event of ["note-service-changed", "folder-service-changed"]) {
+      void listen<{ profile_id: string; source: string }>(event, ({ payload }) => {
+        if (payload.source === "remote") return;
+        void getQueueSession().then(session => { if (!disposed && payload.profile_id === session.profile_id) wake(); });
+      }).then(stop => { if (disposed) stop(); else stops.push(stop); });
+    }
+    return () => { disposed = true; window.removeEventListener("local-outbox-ready", wake); stops.forEach(stop => stop()); };
+  }, [auth.status, enabled, flushQueue, pullAndApply]);
 
   // Subscribe to settings changes when sync is on so edits anywhere in the UI
   // hit `notifySettingsChanged` and trigger the debounced push.

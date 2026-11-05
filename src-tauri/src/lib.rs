@@ -8,11 +8,15 @@ mod folders;
 mod hotkeys;
 mod logging;
 mod logs;
+#[cfg(windows)]
+mod mcp;
+mod note_service;
 mod notes;
 mod profiles;
 mod state;
 mod streaming;
 mod sync;
+mod sync_queue;
 mod transcription;
 mod transcription_local;
 mod transcriptions;
@@ -137,6 +141,40 @@ pub fn run() {
             commands::system::get_device_info,
             commands::files::delete_recording_files,
             notes::list_notes,
+            commands::note_editors::get_profile_session,
+            commands::note_editors::register_note_editor,
+            commands::note_editors::read_editor_note,
+            commands::note_editors::read_note_metadata_batch,
+            commands::note_editors::begin_note_edit,
+            commands::note_editors::save_editor_note,
+            commands::note_editors::ack_editor_prepare,
+            commands::note_editors::end_note_edit,
+            commands::sync_queue::load_sync_queue,
+            commands::sync_queue::save_sync_queue,
+            #[cfg(windows)]
+            commands::mcp::mcp_get_status,
+            #[cfg(windows)]
+            commands::mcp::mcp_set_enabled,
+            #[cfg(windows)]
+            commands::mcp::mcp_create_connection,
+            #[cfg(windows)]
+            commands::mcp::mcp_revoke_connection,
+            #[cfg(windows)]
+            commands::mcp::mcp_rotate_connection,
+            #[cfg(windows)]
+            commands::mcp::mcp_get_client_config,
+            #[cfg(windows)]
+            commands::mcp::mcp_get_audit,
+            #[cfg(windows)]
+            commands::mcp::mcp_test_connection,
+            #[cfg(windows)]
+            commands::mcp::mcp_reset_installation,
+            commands::local_mutations::list_local_mutations,
+            commands::local_mutations::ack_local_mutations,
+            commands::local_mutations::apply_sync_remote_note,
+            commands::local_mutations::apply_sync_remote_folder,
+            commands::local_mutations::purge_sync_tombstones,
+            commands::local_mutations::seed_local_sync_snapshot,
             notes::read_note,
             notes::create_note,
             notes::update_note,
@@ -219,10 +257,7 @@ pub fn run() {
             // Enable logging to frontend
             log_layer.set_app_handle(app.handle().clone());
 
-            tracing::info!(
-                "Lexena v{} started",
-                app.package_info().version
-            );
+            tracing::info!("Lexena v{} started", app.package_info().version);
 
             // Profile system: migrate legacy data then init active profile
             if let Err(e) = profiles::migrate_legacy_to_default(app.handle()) {
@@ -254,6 +289,76 @@ pub fn run() {
                 }
                 _ => {}
             }
+
+            // Replay durable intents before any renderer, sync, or MCP session
+            // can read a partially applied transaction. A failed profile stays closed.
+            for profile in profiles::load_manifest(app.handle())?.profiles {
+                if let Err(error) = note_service::ProfileScope::resolve(app.handle(), &profile.id)
+                    .and_then(|scope| {
+                        note_service::journal::Journal::recover_profile(&scope)?;
+                        note_service::journal::Journal::compact(&scope)
+                    })
+                {
+                    // Every repository call repeats this gate. An unrecoverable
+                    // profile remains closed while other app functions work.
+                    tracing::error!(
+                        "Note recovery refused for profile {}: {}",
+                        profile.id,
+                        error
+                    );
+                }
+            }
+            #[cfg(windows)]
+            {
+                let data = app.path().app_data_dir()?;
+                let executable = std::env::current_exe()?;
+                let local = commands::mcp::LocalMcpState::new(data.clone(), &executable)?;
+                let server = mcp::server::McpServer::new(
+                    data,
+                    local.grants.clone(),
+                    std::sync::Arc::new(mcp::native::TauriEditors::new(app.handle().clone())),
+                );
+                local.set_handler(server.session_handler())?;
+                app.manage(server);
+                app.manage(local);
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = handle
+                        .state::<commands::mcp::LocalMcpState>()
+                        .start_if_enabled()
+                        .await
+                    {
+                        tracing::warn!("Local MCP startup failed: {}", error);
+                    }
+                });
+            }
+
+            let maintenance_app_data = app.path().app_data_dir()?;
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+                    let data = maintenance_app_data.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(manifest) = note_service::ProfileRegistry::manifest_in(&data) {
+                            for profile in manifest.profiles {
+                                if let Err(error) =
+                                    note_service::ProfileScope::resolve_in(&data, &profile.id)
+                                        .and_then(|scope| {
+                                            note_service::journal::Journal::compact(&scope)
+                                        })
+                                {
+                                    tracing::warn!(
+                                        "Note history maintenance refused for profile {}: {}",
+                                        profile.id,
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .await;
+                }
+            });
 
             // Window setup
             window::create_mini_window(&app.handle())?;

@@ -4,56 +4,128 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { type NoteData, type NoteMeta } from "@/hooks/useNotes";
 import { type FolderMeta } from "@/hooks/useFolders";
-
-/** A remote (sync pull) content reload is skipped when the user typed in this
- *  window recently — local edits win and the next save resolves via LWW. */
-const REMOTE_RELOAD_QUIET_MS = 3_000;
+import { createNoteMetadataRefresh, createScopedMetadataRefresh, mergeNoteMetadata, type MetadataChange, type MetadataSession } from "@/lib/notes/metadata-refresh";
 
 /**
  * Data layer of a detached note window (spec §5): loads the note + the
  * notes/folders lists (for wiki-links and the breadcrumb), saves to disk
- * directly via `update_note`, and talks to the main window through events.
+ * through the ownership service, and talks to main with profile-bound events.
  * NO sync state lives here — the main window owns the queue.
  */
 export function useDetachedNote(noteId: string) {
-  const [meta, setMeta] = useState<NoteMeta | null>(null);
-  const [notes, setNotes] = useState<NoteMeta[]>([]);
-  const [folders, setFolders] = useState<FolderMeta[]>([]);
-  const [loadFailed, setLoadFailed] = useState(false);
-  const lastLocalEditRef = useRef(0);
+  const [{ meta, notes, folders, loadFailed }, setMetadata] = useState<{
+    meta: NoteMeta | null; notes: NoteMeta[]; folders: FolderMeta[]; loadFailed: boolean;
+  }>({ meta: null, notes: [], folders: [], loadFailed: false });
+  const markNoteChanges = useRef<(ids: string[]) => void>(() => {});
+  const sessionRef = useRef<Promise<{profile_id:string;session_generation:number}> | null>(null);
+  const getSession = useCallback(() => sessionRef.current ??= invoke("get_profile_session"),[]);
+  const emitScoped = useCallback((name:string,payload:Record<string,unknown>) => {
+    void getSession().then(session => emit(name,{...payload,...session})).catch(error => console.error("Detached note event rejected",error));
+  },[getSession]);
 
-  const refreshLists = useCallback(async () => {
-    try {
-      const [allNotes, allFolders] = await Promise.all([
-        invoke<NoteMeta[]>("list_notes"),
-        invoke<FolderMeta[]>("list_folders"),
-      ]);
-      setNotes(allNotes);
-      setFolders(allFolders);
-      const fresh = allNotes.find((n) => n.id === noteId);
-      if (fresh) {
-        setMeta(fresh);
-      } else if (!allNotes.some((n) => n.id === noteId)) {
-        setLoadFailed(true);
-      }
-    } catch (e) {
-      console.error("[note-window] failed to refresh lists:", e);
-      setLoadFailed(true);
-    }
-  }, [noteId]);
-
-  // Initial load + refresh on window focus (picks up folder moves, favorite
-  // toggles and renames done in the main window while we were unfocused).
   useEffect(() => {
+    let disposed = false;
+    let fullLoad = 0;
+    // Only retain changes for in-flight full loads. Targeted events never cause
+    // a full scan, and unrelated initial/wiki-link entries still get installed.
+    const snapshots = new Set<{ noteIds: Set<string>; foldersChanged: boolean }>();
+    const changedNotes = (ids: string[]) => {
+      for (const snapshot of snapshots) ids.forEach(id => snapshot.noteIds.add(id));
+    };
+    const changedFolders = () => {
+      for (const snapshot of snapshots) snapshot.foldersChanged = true;
+    };
+    markNoteChanges.current = changedNotes;
+    const refreshLists = async () => {
+      const order = ++fullLoad;
+      const snapshot = { noteIds: new Set<string>(), foldersChanged: false };
+      snapshots.add(snapshot);
+      try {
+        const captured = await getSession();
+        if (disposed) return;
+        const [allNotes, allFolders] = await Promise.all([
+          invoke<NoteMeta[]>("list_notes"),
+          invoke<FolderMeta[]>("list_folders"),
+        ]);
+        const current = await invoke<MetadataSession>("get_profile_session");
+        if (disposed || order !== fullLoad || current.profile_id !== captured.profile_id
+          || current.session_generation !== captured.session_generation) return;
+        setMetadata(previous => {
+          if (disposed || order !== fullLoad) return previous;
+          const ids = [...snapshot.noteIds];
+          const merged = mergeNoteMetadata(allNotes, ids, previous.notes);
+          const own = merged.find(note => note.id === noteId && !note.deletedAt) ?? null;
+          return { notes: merged, folders: snapshot.foldersChanged ? previous.folders : allFolders,
+            meta: own, loadFailed: own === null };
+        });
+      } catch (error) {
+        if (!disposed && order === fullLoad) {
+          console.error("[note-window] failed to refresh lists:", error);
+          setMetadata(previous => ({ ...previous, loadFailed: true }));
+        }
+      } finally {
+        snapshots.delete(snapshot);
+      }
+    };
     void refreshLists();
-    const win = getCurrentWindow();
-    const unlistenPromise = win.onFocusChanged(({ payload: focused }) => {
-      if (focused) void refreshLists();
+    const focusSubscription = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      if (focused && !disposed) void refreshLists();
+    });
+    let noteRefresh: ReturnType<typeof createNoteMetadataRefresh> | undefined;
+    let folderRefresh: ReturnType<typeof createScopedMetadataRefresh<FolderMeta>> | undefined;
+    const subscriptions = getSession().then<Array<() => void>>(session => {
+      if (disposed) return [];
+      const matches = (change: Omit<MetadataChange, 'note_id'>) => !disposed
+        && change.profile_id === session.profile_id
+        && (change.session_generation === undefined || change.session_generation === session.session_generation);
+      noteRefresh = createNoteMetadataRefresh(session, (ids, values) => {
+        changedNotes(ids);
+        setMetadata(previous => {
+          if (disposed) return previous;
+          const merged = mergeNoteMetadata(previous.notes, ids, values);
+          const own = ids.includes(noteId) ? values.find(note => note.id === noteId && !note.deletedAt) ?? null : previous.meta;
+          return { ...previous, notes: merged, meta: own, loadFailed: ids.includes(noteId) ? own === null : previous.loadFailed };
+        });
+      }, error => console.warn("[note-window] metadata refresh failed:", error));
+      folderRefresh = createScopedMetadataRefresh<FolderMeta>({
+        session,
+        currentSession: () => invoke<MetadataSession>("get_profile_session"),
+        fetch: () => invoke<FolderMeta[]>("list_folders"),
+        apply: (_ids, values) => {
+          changedFolders();
+          setMetadata(previous => disposed ? previous : ({ ...previous, folders: values }));
+        },
+        onError: error => console.warn("[note-window] folder refresh failed:", error),
+      });
+      return Promise.all([
+        listen<MetadataChange>('note-service-changed', event => {
+          if (!matches(event.payload) || !event.payload.note_id) return;
+          noteRefresh?.enqueue(event.payload);
+        }),
+        listen<Omit<MetadataChange, 'note_id'>>('folder-service-changed', event => {
+          if (!matches(event.payload)) return;
+          folderRefresh?.enqueue({ ...event.payload, note_id: 'folders' });
+        }),
+        listen<{ meta: NoteMeta } & MetadataSession>('note-meta-updated', event => {
+          if (!matches(event.payload) || event.payload.session_generation !== session.session_generation
+            || event.payload.meta.id !== noteId) return;
+          changedNotes([noteId]);
+          const own = event.payload.meta;
+          setMetadata(previous => ({ ...previous, meta: own.deletedAt ? null : own,
+            loadFailed: Boolean(own.deletedAt), notes: mergeNoteMetadata(previous.notes, [noteId], [own]) }));
+        }),
+      ]);
     });
     return () => {
-      void unlistenPromise.then((unlisten) => unlisten());
+      disposed = true;
+      snapshots.clear();
+      if (markNoteChanges.current === changedNotes) markNoteChanges.current = () => {};
+      noteRefresh?.dispose();
+      folderRefresh?.dispose();
+      void focusSubscription.then(unlisten => unlisten()).catch(() => {});
+      void subscriptions.then(listeners => listeners.forEach(unlisten => unlisten())).catch(() => {});
     };
-  }, [refreshLists]);
+  }, [getSession, noteId]);
 
   // Keep the OS window title in sync with the note title.
   useEffect(() => {
@@ -61,86 +133,34 @@ export function useDetachedNote(noteId: string) {
     void getCurrentWindow().setTitle(title ? `${title} — Lexena` : "Lexena");
   }, [meta?.title]);
 
-  // Meta pushed back by the main window (local-only toggle round-trip).
-  useEffect(() => {
-    const unlistenPromise = listen<{ meta: NoteMeta }>(
-      "note-meta-updated",
-      (event) => {
-        if (event.payload.meta.id === noteId) setMeta(event.payload.meta);
-      },
-    );
-    return () => {
-      void unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, [noteId]);
-
   const readNote = useCallback(
     (id: string) => invoke<NoteData>("read_note", { id }),
     [],
   );
 
-  /** Immediate disk write + broadcast: the (possibly hidden) main window
-   *  refreshes its sidebar metadata and schedules the cloud push. */
-  const handleUpdateNote = useCallback(
-    async (id: string, content: string, title: string) => {
-      lastLocalEditRef.current = Date.now();
-      try {
-        const updated = await invoke<NoteMeta>("update_note", {
-          id,
-          content,
-          title,
-        });
-        setMeta(updated);
-        setNotes((prev) => prev.map((n) => (n.id === id ? updated : n)));
-        await emit("note-detached-updated", {
-          id,
-          title: updated.title,
-          updatedAt: updated.updatedAt,
-        });
-      } catch (e) {
-        console.error("[note-window] failed to save note:", e);
-      }
-    },
-    [],
-  );
-
-  const markLocalEdit = useCallback(() => {
-    lastLocalEditRef.current = Date.now();
-  }, []);
-
-  const isQuiescent = useCallback(
-    () => Date.now() - lastLocalEditRef.current > REMOTE_RELOAD_QUIET_MS,
-    [],
-  );
-
-  /** Re-read the note from disk (remote-update reload). Updates meta and
-   *  returns the fresh data so the caller can feed the editor. */
-  const reloadFromDisk = useCallback(async (): Promise<NoteData | null> => {
-    try {
-      const data = await invoke<NoteData>("read_note", { id: noteId });
-      setMeta(data.meta);
-      return data;
-    } catch (e) {
-      console.error("[note-window] failed to reload note:", e);
-      return null;
-    }
-  }, [noteId]);
+  /** The ownership service has already persisted content and its durable outbox. */
+  const applySavedNoteMeta = useCallback((updated:NoteMeta) => {
+    markNoteChanges.current([updated.id]);
+    setMetadata(previous => ({ ...previous, meta: updated.deletedAt ? null : updated,
+      loadFailed: Boolean(updated.deletedAt), notes: mergeNoteMetadata(previous.notes, [updated.id], [updated]) }));
+    emitScoped("note-detached-updated", {id:updated.id,title:updated.title,updatedAt:updated.updatedAt});
+  },[emitScoped]);
 
   const requestReattach = useCallback(() => {
-    void emit("note-reattach-request", { id: noteId });
-  }, [noteId]);
+    emitScoped("note-reattach-request", { id: noteId });
+  }, [noteId,emitScoped]);
 
   const requestDelete = useCallback(() => {
-    void emit("note-detached-delete-request", { id: noteId });
-  }, [noteId]);
+    emitScoped("note-detached-delete-request", { id: noteId });
+  }, [noteId,emitScoped]);
 
   const requestToggleLocalOnly = useCallback(() => {
-    void emit("note-toggle-local-only-request", { id: noteId });
-  }, [noteId]);
+    emitScoped("note-toggle-local-only-request", { id: noteId });
+  }, [noteId,emitScoped]);
 
   const openNoteInMain = useCallback((id: string) => {
-    void emit("note-open-request", { id });
-  }, []);
+    emitScoped("note-open-request", { id });
+  }, [emitScoped]);
 
   return {
     meta,
@@ -148,10 +168,7 @@ export function useDetachedNote(noteId: string) {
     folders,
     loadFailed,
     readNote,
-    handleUpdateNote,
-    markLocalEdit,
-    isQuiescent,
-    reloadFromDisk,
+    applySavedNoteMeta,
     requestReattach,
     requestDelete,
     requestToggleLocalOnly,

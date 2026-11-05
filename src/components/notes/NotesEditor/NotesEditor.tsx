@@ -22,8 +22,8 @@ interface NotesEditorProps {
   onActivateNote: (id: string) => void;
   onOpenNoteInTab: (id: string) => void;
   onCloseNote: (id: string) => void;
-  onDeleteNote: (id: string) => void;
-  onUpdateNote: (id: string, content: string, title: string) => void;
+  onDeleteNote: (id: string) => void | Promise<void>;
+  onNoteSaved: (meta: NoteMeta) => void;
   onToggleLocalOnly: (id: string) => void;
   onCreateNote: () => void;
   /** Create a new note seeded with the given title. Does NOT open a tab —
@@ -51,7 +51,7 @@ export function NotesEditor({
   onOpenNoteInTab,
   onCloseNote,
   onDeleteNote,
-  onUpdateNote,
+  onNoteSaved,
   onToggleLocalOnly,
   onCreateNote,
   onRecreateLinkedNote,
@@ -76,11 +76,11 @@ export function NotesEditor({
     [],
   );
 
-  const { editor, isLoadingContent, loadedNoteId, flushSave } = useNotesEditorInstance({
+  const { editor, isLoadingContent, loadedNoteId, flushSave, closeEditor, saveError } = useNotesEditorInstance({
     openNotes,
     activeNoteId,
     readNote,
-    onUpdateNote,
+    onNoteSaved,
     getNoteLinkRefs,
     onContentSaved: bumpBacklinks,
   });
@@ -104,7 +104,7 @@ export function NotesEditor({
     try {
       const newId = await onRecreateLinkedNote(title);
       onResolved(newId);
-      flushSave();
+      await flushSave();
       onOpenNoteInTab(newId);
     } catch (err) {
       console.error("Failed to recreate linked note:", err);
@@ -132,7 +132,7 @@ export function NotesEditor({
       // already open, then activate it. `onActivateNote` only flips the
       // active id without touching the tab list, which left the editor on
       // the empty-state placeholder. `onOpenNoteInTab` does both.
-      onOpenNote: onOpenNoteInTab,
+      onOpenNote: (id:string) => { void flushSave().then(() => onOpenNoteInTab(id)).catch(() => {}); },
       onRequestRecreate: (
         attrs: { id: string; title: string },
         onResolved: (newId: string) => void,
@@ -140,7 +140,7 @@ export function NotesEditor({
         setBrokenDialog({ title: attrs.title, onResolved });
       },
     }),
-    [notes, existingNoteIds, activeNoteId, onOpenNoteInTab],
+    [notes, existingNoteIds, activeNoteId, onOpenNoteInTab, flushSave],
   );
 
   const isActiveNoteEmpty = (id: string): boolean => {
@@ -149,18 +149,17 @@ export function NotesEditor({
     return editor.getText().trim() === "";
   };
 
-  const handleTabClose = (id: string) => {
+  const handleTabClose = async (id: string) => {
     if (isActiveNoteEmpty(id)) {
-      onDeleteNote(id);
+      try { await flushSave(); await onDeleteNote(id); } catch { return; }
     } else {
+      try { if (id === activeNoteId) await closeEditor(); } catch { return; }
       onCloseNote(id);
     }
   };
 
-  const handleConfirmDelete = () => {
-    if (activeNoteId) {
-      onDeleteNote(activeNoteId);
-    }
+  const handleConfirmDelete = async () => {
+    try { await flushSave(); if (activeNoteId) await onDeleteNote(activeNoteId); } catch { return; }
     setConfirmDeleteOpen(false);
   };
 
@@ -176,25 +175,25 @@ export function NotesEditor({
           loadedNoteId={loadedNoteId}
           folders={folders}
           editor={editor}
-          onActivateNote={onActivateNote}
-          onTabClose={handleTabClose}
-          onCreateNote={onCreateNote}
+          onActivateNote={(id) => { void flushSave().then(() => onActivateNote(id)).catch(() => {}); }}
+          onTabClose={(id) => { void handleTabClose(id); }}
+          onCreateNote={() => { void flushSave().then(onCreateNote).catch(() => {}); }}
           onMoveNote={onMoveNote}
           onCreateFolder={onCreateFolder}
           onDetachNote={(id) => {
             // Flush the 500 ms debounced save before ownership moves to the
             // detached window — otherwise the timer can fire after the tab
             // switch and write the NEXT note's HTML under this note's id.
-            flushSave();
-            onDetachNote(id);
+            void flushSave().then(() => onDetachNote(id)).catch(() => {});
           }}
           onDetachNoteAtCursor={(id) => {
             // Same flush-before-transfer invariant as onDetachNote above —
             // a drag-out is another ownership transfer to a detached window.
-            flushSave();
-            onDetachNoteAtCursor(id);
+            void flushSave().then(() => onDetachNoteAtCursor(id)).catch(() => {});
           }}
         />
+
+        {saveError && <div className="notes-error-banner" role="alert">{saveError}</div>}
 
         <NotesEditorContent
           editor={editor}

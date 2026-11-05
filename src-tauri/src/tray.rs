@@ -1,8 +1,8 @@
 use tauri::{
-    Manager,
     image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager,
 };
 
 pub(crate) fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -24,6 +24,9 @@ pub(crate) fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error:
                 }
             }
             "quit" => {
+                #[cfg(windows)]
+                crate::mcp::lifecycle::quit(app.clone());
+                #[cfg(not(windows))]
                 app.exit(0);
             }
             _ => {}
@@ -48,13 +51,16 @@ pub(crate) fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error:
 }
 
 #[tauri::command]
-pub fn update_tray_labels(app: tauri::AppHandle, show_label: String, quit_label: String) -> Result<(), String> {
+pub fn update_tray_labels(
+    app: tauri::AppHandle,
+    show_label: String,
+    quit_label: String,
+) -> Result<(), String> {
     let show_item = MenuItem::with_id(&app, "show", &show_label, true, None::<&str>)
         .map_err(|e| e.to_string())?;
     let quit_item = MenuItem::with_id(&app, "quit", &quit_label, true, None::<&str>)
         .map_err(|e| e.to_string())?;
-    let menu = Menu::with_items(&app, &[&show_item, &quit_item])
-        .map_err(|e| e.to_string())?;
+    let menu = Menu::with_items(&app, &[&show_item, &quit_item]).map_err(|e| e.to_string())?;
 
     if let Some(tray) = app.tray_by_id("main-tray") {
         let _ = tray.set_menu(Some(menu));

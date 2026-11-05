@@ -5,6 +5,7 @@ import {
   Keyboard,
   Mic,
   Palette,
+  Plug,
   Settings,
   Sparkles,
   UserCircle2,
@@ -19,7 +20,7 @@ export interface NavItemDef {
 }
 
 /**
- * The seven top-level settings pages. Several former pages were folded into
+ * The top-level settings pages. Several former pages were folded into
  * these (see `resolveSettingsTarget` for the legacy → new mapping):
  *  - `section-dictee`   ← transcription + post-process + vocabulary
  *  - `section-raccourcis` also hosts the insertion-mode card (was in system)
@@ -32,6 +33,7 @@ export type SettingsSectionId =
   | "section-apparence"
   | "section-raccourcis"
   | "section-compte"
+  | "section-integrations"
   | "section-systeme"
   | "section-a-propos";
 
@@ -72,6 +74,13 @@ export const NAV_ITEM_DEFS: NavItemDef[] = [
     subtitleKey: "auth.account.sectionSubtitle",
   },
   {
+    id: "section-integrations",
+    icon: <Plug className="w-3.5 h-3.5 text-vt-accent" />,
+    iconBg: "bg-vt-accent/10",
+    titleKey: "settings.nav.integrations",
+    subtitleKey: "settings.nav.integrationsSubtitle",
+  },
+  {
     id: "section-systeme",
     icon: <Settings className="w-3.5 h-3.5 text-vt-warn" />,
     iconBg: "bg-vt-warn/10",
@@ -110,6 +119,7 @@ const LEGACY_SECTION_TARGETS: Record<
   "section-post-process": { section: "section-dictee", anchor: "section-post-process" },
   "section-vocabulaire": { section: "section-dictee", anchor: "section-vocabulaire" },
   "section-cloud": { section: "section-compte", anchor: "section-cloud" },
+  "section-mcp": { section: "section-integrations", anchor: "section-mcp" },
   "section-mises-a-jour": { section: "section-a-propos", anchor: "section-mises-a-jour" },
 };
 

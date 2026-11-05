@@ -1,25 +1,15 @@
+#[allow(unused_imports)] // Transitional public compatibility for existing callers.
+pub use crate::note_service::scope::{
+    generate_unique_id, name_to_id, profile_exists, validate_profile_name, ProfileMeta,
+    ProfilesManifest,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
 
 use crate::state::AppState;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProfileMeta {
-    pub id: String,
-    pub name: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfilesManifest {
-    pub active: String,
-    pub profiles: Vec<ProfileMeta>,
-}
 
 fn get_manifest_path(app: &AppHandle) -> Result<PathBuf> {
     let app_data = app
@@ -35,7 +25,7 @@ pub fn get_profile_dir(app: &AppHandle, profile_id: &str) -> Result<PathBuf> {
         .path()
         .app_data_dir()
         .context("Could not resolve app data directory")?;
-    Ok(app_data.join("profiles").join(profile_id))
+    crate::note_service::scope::checked_profile_root_in(&app_data, profile_id).map_err(Into::into)
 }
 
 /// Get the directory for the currently active profile
@@ -97,42 +87,34 @@ pub fn dictionary_store_path(app: &AppHandle) -> String {
     profile_store_path(&get_active_id(app), "sync-dictionary.json")
 }
 
-fn load_manifest_from_path(path: &PathBuf) -> Result<ProfilesManifest> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read profiles.json: {}", path.display()))?;
-    serde_json::from_str(&content).context("Failed to parse profiles.json")
-}
-
 pub fn load_manifest(app: &AppHandle) -> Result<ProfilesManifest> {
     let path = get_manifest_path(app)?;
-    load_manifest_from_path(&path)
-}
-
-pub fn save_manifest(app: &AppHandle, manifest: &ProfilesManifest) -> Result<()> {
-    let path = get_manifest_path(app)?;
-    let content =
-        serde_json::to_string_pretty(manifest).context("Failed to serialize manifest")?;
-    fs::write(&path, &content)
-        .with_context(|| format!("Failed to write profiles.json: {}", path.display()))?;
-    Ok(())
+    crate::note_service::ProfileRegistry::manifest_in(path.parent().expect("manifest parent"))
+        .map_err(Into::into)
 }
 
 /// First-time migration: if profiles.json doesn't exist, move existing data
 /// (settings.json, notes/, transcriptions/, recordings/) into profiles/default/.
 pub fn migrate_legacy_to_default(app: &AppHandle) -> Result<()> {
+    let _registry = crate::note_service::scope::registry_write();
     let app_data = app
         .path()
         .app_data_dir()
         .context("Could not resolve app data directory")?;
 
-    let manifest_path = app_data.join("profiles.json");
+    fs::create_dir_all(&app_data)?;
+    let app_data = fs::canonicalize(&app_data)?;
+    let manifest_path = crate::note_service::scope::checked_relative(
+        &app_data,
+        std::path::Path::new("profiles.json"),
+    )?;
     if manifest_path.exists() {
         return Ok(()); // Already migrated
     }
 
     tracing::info!("Profiles migration: moving existing data into profiles/default/");
 
-    let default_dir = app_data.join("profiles").join("default");
+    let default_dir = crate::note_service::scope::checked_profile_root_in(&app_data, "default")?;
     fs::create_dir_all(&default_dir).context("Failed to create profiles/default directory")?;
 
     let items = [
@@ -143,8 +125,14 @@ pub fn migrate_legacy_to_default(app: &AppHandle) -> Result<()> {
     ];
 
     for (src_name, dst_name) in &items {
-        let src = app_data.join(src_name);
-        let dst = default_dir.join(dst_name);
+        let src = crate::note_service::scope::checked_relative(
+            &app_data,
+            std::path::Path::new(src_name),
+        )?;
+        let dst = crate::note_service::scope::checked_relative(
+            &default_dir,
+            std::path::Path::new(dst_name),
+        )?;
         if src.exists() {
             match fs::rename(&src, &dst) {
                 Ok(_) => tracing::info!(
@@ -178,17 +166,23 @@ pub fn migrate_legacy_to_default(app: &AppHandle) -> Result<()> {
 
 /// Load manifest (creating a default one if absent), then populate AppState.active_profile_id.
 pub fn init_active_profile(app: &AppHandle) -> Result<()> {
+    let _registry = crate::note_service::scope::registry_write();
     let app_data = app
         .path()
         .app_data_dir()
         .context("Could not resolve app data directory")?;
-    let manifest_path = app_data.join("profiles.json");
+    fs::create_dir_all(&app_data)?;
+    let app_data = fs::canonicalize(&app_data)?;
+    let manifest_path = crate::note_service::scope::checked_relative(
+        &app_data,
+        std::path::Path::new("profiles.json"),
+    )?;
 
     if !manifest_path.exists() {
         // Fresh install with no legacy data
-        let default_dir = app_data.join("profiles").join("default");
-        fs::create_dir_all(&default_dir)
-            .context("Failed to create profiles/default directory")?;
+        let default_dir =
+            crate::note_service::scope::checked_profile_root_in(&app_data, "default")?;
+        fs::create_dir_all(&default_dir).context("Failed to create profiles/default directory")?;
 
         let manifest = ProfilesManifest {
             active: "default".to_string(),
@@ -202,10 +196,11 @@ pub fn init_active_profile(app: &AppHandle) -> Result<()> {
         fs::write(&manifest_path, &content).context("Failed to write initial profiles.json")?;
     }
 
-    let manifest = load_manifest_from_path(&manifest_path)?;
+    let manifest = crate::note_service::scope::read_manifest_unlocked(&app_data)?;
 
     // Ensure the active profile directory exists
-    let profile_dir = app_data.join("profiles").join(&manifest.active);
+    let profile_dir =
+        crate::note_service::scope::checked_profile_root_in(&app_data, &manifest.active)?;
     if !profile_dir.exists() {
         fs::create_dir_all(&profile_dir).with_context(|| {
             format!(
@@ -294,10 +289,6 @@ pub const AVATAR_DATA_URL_PREFIX: &str = "data:image/png;base64,";
 pub const AVATAR_MAX_BYTES: usize = 1024 * 1024;
 pub const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
-pub fn profile_exists(manifest: &ProfilesManifest, id: &str) -> bool {
-    manifest.profiles.iter().any(|p| p.id == id)
-}
-
 /// Decode and validate an avatar data-URL. Pure (testable).
 pub fn decode_avatar_data_url(data_url: &str) -> Result<Vec<u8>, String> {
     use base64::Engine as _;
@@ -345,54 +336,13 @@ pub fn clear_avatar_in(profile_dir: &std::path::Path) -> Result<(), String> {
 
 // --- ID / name helpers ---
 
-pub fn name_to_id(name: &str) -> String {
-    name.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
-pub fn validate_profile_name(name: &str) -> Result<(), String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("Profile name cannot be empty.".to_string());
-    }
-    if trimmed.len() > 64 {
-        return Err("Profile name is too long (max 64 characters).".to_string());
-    }
-    Ok(())
-}
-
 /// Generate a unique id for a new profile, avoiding collisions with existing ids
 /// and reserved directory names (models, logs).
-pub fn generate_unique_id(base_id: &str, existing: &[ProfileMeta]) -> String {
-    const RESERVED: &[&str] = &["models", "logs"];
-
-    let is_taken =
-        |id: &str| existing.iter().any(|p| p.id == id) || RESERVED.contains(&id);
-
-    if !is_taken(base_id) {
-        return base_id.to_string();
-    }
-
-    let mut counter = 2u32;
-    loop {
-        let candidate = format!("{}-{}", base_id, counter);
-        if !is_taken(&candidate) {
-            return candidate;
-        }
-        counter += 1;
-    }
-}
 
 #[cfg(test)]
 mod tests {
-    use super::profile_store_path;
     use super::cleanup_legacy_root_sync_stores_in;
+    use super::profile_store_path;
     use std::fs;
 
     #[test]
@@ -409,10 +359,7 @@ mod tests {
 
     #[test]
     fn migrate_moves_root_snippets_dict_into_default() {
-        let dir = std::env::temp_dir().join(format!(
-            "lexena_snipmig_test_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("lexena_snipmig_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
         fs::write(dir.join("sync-snippets.json"), "{\"snippets\":[]}").unwrap();
@@ -420,10 +367,22 @@ mod tests {
 
         super::migrate_global_snippets_dict_to_default_in(&dir).unwrap();
 
-        assert!(!dir.join("sync-snippets.json").exists(), "root snippets moved");
-        assert!(dir.join("profiles/default/sync-snippets.json").exists(), "snippets in default");
-        assert!(!dir.join("sync-dictionary.json").exists(), "root dict moved");
-        assert!(dir.join("profiles/default/sync-dictionary.json").exists(), "dict in default");
+        assert!(
+            !dir.join("sync-snippets.json").exists(),
+            "root snippets moved"
+        );
+        assert!(
+            dir.join("profiles/default/sync-snippets.json").exists(),
+            "snippets in default"
+        );
+        assert!(
+            !dir.join("sync-dictionary.json").exists(),
+            "root dict moved"
+        );
+        assert!(
+            dir.join("profiles/default/sync-dictionary.json").exists(),
+            "dict in default"
+        );
 
         // Idempotent
         super::migrate_global_snippets_dict_to_default_in(&dir).unwrap();
@@ -444,22 +403,36 @@ mod tests {
 
     #[test]
     fn cleanup_removes_only_legacy_queue_and_meta() {
-        let dir = std::env::temp_dir().join(format!(
-            "lexena_cleanup_test_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("lexena_cleanup_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        for f in ["sync-queue.json", "sync-meta.json", "sync-snippets.json", "sync-dictionary.json"] {
+        for f in [
+            "sync-queue.json",
+            "sync-meta.json",
+            "sync-snippets.json",
+            "sync-dictionary.json",
+        ] {
             fs::write(dir.join(f), "{}").unwrap();
         }
 
         cleanup_legacy_root_sync_stores_in(&dir).unwrap();
 
-        assert!(!dir.join("sync-queue.json").exists(), "queue should be deleted");
-        assert!(!dir.join("sync-meta.json").exists(), "meta should be deleted");
-        assert!(dir.join("sync-snippets.json").exists(), "snippets must survive");
-        assert!(dir.join("sync-dictionary.json").exists(), "dictionary must survive");
+        assert!(
+            !dir.join("sync-queue.json").exists(),
+            "queue should be deleted"
+        );
+        assert!(
+            !dir.join("sync-meta.json").exists(),
+            "meta should be deleted"
+        );
+        assert!(
+            dir.join("sync-snippets.json").exists(),
+            "snippets must survive"
+        );
+        assert!(
+            dir.join("sync-dictionary.json").exists(),
+            "dictionary must survive"
+        );
 
         // Idempotent: second run with files already gone must not error.
         cleanup_legacy_root_sync_stores_in(&dir).unwrap();

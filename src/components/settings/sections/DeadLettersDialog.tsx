@@ -9,9 +9,9 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import {
-  enqueue,
   getDeadLetters,
   removeDeadLetter,
+  retryDeadLetter,
 } from "@/lib/sync/queue";
 import { useSync } from "@/hooks/useSync";
 import type { SyncQueueEntry } from "@/lib/sync/types";
@@ -23,7 +23,7 @@ interface DeadLettersDialogProps {
 
 export function DeadLettersDialog({ open, onClose }: DeadLettersDialogProps) {
   const { t } = useTranslation();
-  const { refreshDeadLetters } = useSync();
+  const { refreshDeadLetters, syncNow } = useSync();
   const [items, setItems] = useState<SyncQueueEntry[]>([]);
 
   useEffect(() => {
@@ -31,17 +31,18 @@ export function DeadLettersDialog({ open, onClose }: DeadLettersDialogProps) {
     void getDeadLetters().then(setItems);
   }, [open]);
 
-  async function handleRetry(entry: SyncQueueEntry) {
-    await enqueue(entry.operation);
-    await removeDeadLetter(entry.id);
-    setItems((prev) => prev.filter((e) => e.id !== entry.id));
+  async function handleRetry(id: string) {
+    await retryDeadLetter(id);
+    setItems((prev) => prev.filter((e) => e.id !== id));
     await refreshDeadLetters();
+    await syncNow();
   }
 
   async function handleDiscard(id: string) {
     await removeDeadLetter(id);
     setItems((prev) => prev.filter((e) => e.id !== id));
     await refreshDeadLetters();
+    await syncNow();
   }
 
   return (
@@ -51,6 +52,7 @@ export function DeadLettersDialog({ open, onClose }: DeadLettersDialogProps) {
           <DialogTitle>{t("sync.deadLetters.title")}</DialogTitle>
           <DialogDescription>
             {t("sync.deadLetters.subtitle", { count: items.length })}
+            {" "}{t("sync.deadLetters.reconcileAfterDiscard")}
           </DialogDescription>
         </DialogHeader>
 
@@ -78,7 +80,7 @@ export function DeadLettersDialog({ open, onClose }: DeadLettersDialogProps) {
                 <Button
                   size="sm"
                   variant="outline"
-                  onClick={() => void handleRetry(entry)}
+                  onClick={() => void handleRetry(entry.id)}
                 >
                   {t("sync.deadLetters.retry")}
                 </Button>

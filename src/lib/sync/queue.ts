@@ -1,168 +1,154 @@
-import { Store } from "@tauri-apps/plugin-store";
 import { invoke } from "@tauri-apps/api/core";
 import type { SyncOperation, SyncQueueEntry } from "./types";
 import { createMutex } from "./_mutex";
 
-const KEY_QUEUE = "queue";
-const KEY_DLQ = "dead-letters";
-
 export const MAX_RETRIES_BEFORE_DLQ = 5;
-
-let storePromise: Promise<Awaited<ReturnType<typeof Store.load>>> | null = null;
+export interface ProfileQueueSession { profile_id: string; session_generation: number }
+export interface QueueSnapshot {
+  queue: SyncQueueEntry[];
+  deadLetters: SyncQueueEntry[];
+  importedOutboxSequence: number;
+  revision: string;
+  protectedEntities?: ProtectedEntity[];
+}
+export interface ProtectedEntity { kind: "note" | "folder"; id: string; sequence: number; reason: "empty" | "too_large" | "invalid_id" | "invalid_folder" }
+let sessionPromise: Promise<ProfileQueueSession> | null = null;
 const withLock = createMutex();
 
-function getStore() {
-  if (!storePromise) {
-    storePromise = (async () => {
-      const path = await invoke<string>("get_active_profile_sync_queue_path");
-      return Store.load(path);
-    })();
-  }
-  return storePromise;
+/** Captured once per renderer; a late callback must never adopt another profile. */
+export function getQueueSession(): Promise<ProfileQueueSession> {
+  return sessionPromise ??= invoke<ProfileQueueSession>("get_profile_session");
 }
+export function __resetForTests() { sessionPromise = null; }
 
-export function __resetForTests() {
-  storePromise = null;
+export async function loadSnapshot(): Promise<QueueSnapshot> {
+  return invoke<QueueSnapshot>("load_sync_queue", { session: await getQueueSession() });
 }
-
-async function loadQueue(): Promise<SyncQueueEntry[]> {
-  const store = await getStore();
-  const q = await store.get<SyncQueueEntry[]>(KEY_QUEUE);
-  return q ?? [];
-}
-
-async function saveQueue(q: SyncQueueEntry[]): Promise<void> {
-  const store = await getStore();
-  await store.set(KEY_QUEUE, q);
-  await store.save();
-}
-
-export async function enqueue(op: SyncOperation): Promise<SyncQueueEntry> {
+async function changeSnapshot<T>(change: (snapshot: QueueSnapshot) => T): Promise<T> {
   return withLock(async () => {
-    const q = await loadQueue();
-    const entry: SyncQueueEntry = {
-      id: crypto.randomUUID(),
-      operation: op,
-      enqueued_at: new Date().toISOString(),
-      retry_count: 0,
-      last_error: null,
-      next_retry_at: null,
-    };
-    q.push(entry);
-    await saveQueue(q);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const snapshot = await loadSnapshot();
+      const result = change(snapshot);
+      try {
+        await invoke<QueueSnapshot>("save_sync_queue", {
+          session: await getQueueSession(), snapshot, expectedRevision: snapshot.revision,
+        });
+        return result;
+      } catch (error) {
+        if (!String(error).includes("SYNC_QUEUE_REVISION_CONFLICT") || attempt === 2) throw error;
+      }
+    }
+    throw new Error("SYNC_QUEUE_REVISION_CONFLICT");
+  });
+}
+
+function makeEntry(operation: SyncOperation, id: string = crypto.randomUUID()): SyncQueueEntry {
+  return { id, operation, enqueued_at: new Date().toISOString(), retry_count: 0, last_error: null, next_retry_at: null };
+}
+export async function enqueue(op: SyncOperation): Promise<SyncQueueEntry> {
+  const entry = makeEntry(op);
+  return changeSnapshot((snapshot) => { snapshot.queue.push(entry); return entry; });
+}
+export async function enqueueWithId(id: string, op: SyncOperation): Promise<SyncQueueEntry> {
+  const entry = makeEntry(op, id);
+  return changeSnapshot((snapshot) => {
+    const existing = [...snapshot.queue, ...snapshot.deadLetters].find((item) => item.id === id);
+    if (existing) return existing;
+    snapshot.queue.push(entry);
     return entry;
   });
 }
-
-export async function peekAll(): Promise<SyncQueueEntry[]> {
-  return loadQueue();
-}
-
-export async function peekHead(): Promise<SyncQueueEntry | null> {
-  const q = await loadQueue();
-  return q[0] ?? null;
-}
-
+export async function peekAll(): Promise<SyncQueueEntry[]> { return (await loadSnapshot()).queue; }
+export async function peekHead(): Promise<SyncQueueEntry | null> { return (await peekAll())[0] ?? null; }
 export async function peekReadyHead(): Promise<SyncQueueEntry | null> {
-  const q = await loadQueue();
-  const head = q[0];
-  if (!head) return null;
-  if (head.next_retry_at && new Date(head.next_retry_at).getTime() > Date.now()) {
-    return null;
-  }
-  return head;
+  const head = await peekHead();
+  return head && (!head.next_retry_at || new Date(head.next_retry_at).getTime() <= Date.now()) ? head : null;
 }
-
 export async function dequeue(): Promise<SyncQueueEntry | null> {
-  return withLock(async () => {
-    const q = await loadQueue();
-    if (q.length === 0) return null;
-    const head = q.shift()!;
-    await saveQueue(q);
-    return head;
-  });
+  return changeSnapshot((snapshot) => snapshot.queue.shift() ?? null);
 }
-
 export async function dequeueById(id: string): Promise<SyncQueueEntry | null> {
-  return withLock(async () => {
-    const q = await loadQueue();
-    const idx = q.findIndex((e) => e.id === id);
-    if (idx < 0) return null;
-    const [removed] = q.splice(idx, 1);
-    await saveQueue(q);
-    return removed;
+  return changeSnapshot((snapshot) => {
+    const index = snapshot.queue.findIndex((entry) => entry.id === id);
+    return index < 0 ? null : snapshot.queue.splice(index, 1)[0];
   });
 }
-
 export async function markRetry(id: string, error: string): Promise<void> {
-  return withLock(async () => {
-    const q = await loadQueue();
-    const idx = q.findIndex((e) => e.id === id);
-    if (idx < 0) return;
-    const newCount = q[idx].retry_count + 1;
-    const next = new Date(Date.now() + backoffMs(newCount - 1)).toISOString();
-    q[idx] = {
-      ...q[idx],
-      retry_count: newCount,
-      last_error: error,
-      next_retry_at: next,
-    };
-    await saveQueue(q);
+  await changeSnapshot((snapshot) => {
+    const entry = snapshot.queue.find((item) => item.id === id);
+    if (!entry) return;
+    entry.retry_count++;
+    entry.last_error = error;
+    entry.next_retry_at = new Date(Date.now() + backoffMs(entry.retry_count - 1)).toISOString();
   });
 }
-
-export async function size(): Promise<number> {
-  const q = await loadQueue();
-  return q.length;
-}
-
-export async function clear(): Promise<void> {
-  return withLock(async () => {
-    await saveQueue([]);
-  });
-}
-
-/** Retourne le délai d'attente avant prochain retry en ms selon retry_count.
- * Backoff : 1s → 5s → 30s → 2min → 5min cap. */
+export async function size(): Promise<number> { return (await peekAll()).length; }
+export async function clear(): Promise<void> { await changeSnapshot((snapshot) => { snapshot.queue = []; }); }
 export function backoffMs(retryCount: number): number {
-  const table = [1_000, 5_000, 30_000, 120_000, 300_000];
-  return table[Math.min(retryCount, table.length - 1)];
+  const delays = [1_000, 5_000, 30_000, 120_000, 300_000];
+  return delays[Math.min(retryCount, delays.length - 1)];
 }
-
-// === Dead-Letter Queue ===
-
-async function loadDlq(): Promise<SyncQueueEntry[]> {
-  const store = await getStore();
-  const d = await store.get<SyncQueueEntry[]>(KEY_DLQ);
-  return d ?? [];
-}
-
-async function saveDlq(d: SyncQueueEntry[]): Promise<void> {
-  const store = await getStore();
-  await store.set(KEY_DLQ, d);
-  await store.save();
-}
-
 export async function moveToDeadLetter(id: string, error: string): Promise<void> {
-  return withLock(async () => {
-    const q = await loadQueue();
-    const idx = q.findIndex((e) => e.id === id);
-    if (idx < 0) return;
-    const [entry] = q.splice(idx, 1);
-    const dlq = await loadDlq();
-    dlq.push({ ...entry, last_error: error });
-    await saveQueue(q);
-    await saveDlq(dlq);
+  await changeSnapshot((snapshot) => {
+    const index = snapshot.queue.findIndex((entry) => entry.id === id);
+    if (index < 0) return;
+    const [entry] = snapshot.queue.splice(index, 1);
+    snapshot.deadLetters.push({ ...entry, last_error: error });
   });
 }
-
-export async function getDeadLetters(): Promise<SyncQueueEntry[]> {
-  return loadDlq();
-}
-
+export async function getDeadLetters(): Promise<SyncQueueEntry[]> { return (await loadSnapshot()).deadLetters; }
 export async function removeDeadLetter(id: string): Promise<void> {
-  return withLock(async () => {
-    const dlq = await loadDlq();
-    await saveDlq(dlq.filter((e) => e.id !== id));
+  await changeSnapshot((snapshot) => { snapshot.deadLetters = snapshot.deadLetters.filter((entry) => entry.id !== id); });
+}
+/** Retry only a still-persisted intention; a stale dialog cannot recreate it. */
+export async function retryDeadLetter(id: string): Promise<SyncQueueEntry | null> {
+  return changeSnapshot((snapshot) => {
+    const index = snapshot.deadLetters.findIndex((entry) => entry.id === id);
+    if (index < 0) return null;
+    const [entry] = snapshot.deadLetters.splice(index, 1);
+    const retried = { ...entry, retry_count: 0, last_error: null, next_retry_at: null };
+    snapshot.queue.push(retried);
+    return retried;
+  });
+}
+export async function getImportedOutboxSequence(): Promise<number> { return (await loadSnapshot()).importedOutboxSequence; }
+
+/** Save entries and checkpoint atomically; checkpoint survives their consumption. */
+export function operationEntityKey(op: SyncOperation): string | null {
+  switch (op.kind) {
+    case "note-upsert": return `note:${op.note.id}`;
+    case "note-delete": return `note:${op.id}`;
+    case "folder-upsert": return `folder:${op.folder.id}`;
+    case "folder-delete": return `folder:${op.id}`;
+    default: return null;
+  }
+}
+export async function importOutboxEntries(entries: SyncQueueEntry[], throughSequence: number, replacedKeys: ReadonlySet<string> = new Set(), protectedEntities: ProtectedEntity[] = [], privateKeys: ReadonlySet<string> = new Set(), seedKeys: ReadonlySet<string> = new Set()): Promise<void> {
+  if (!Number.isSafeInteger(throughSequence) || throughSequence < 0) throw new Error("INVALID_OUTBOX_SEQUENCE");
+  await changeSnapshot((snapshot) => {
+    if (throughSequence <= snapshot.importedOutboxSequence) return;
+    const seededDeadLetters: SyncQueueEntry[] = [];
+    const importedEntries = entries.map(entry => {
+      const key = operationEntityKey(entry.operation) ?? "";
+      if (!seedKeys.has(key)) return entry;
+      const failed = snapshot.deadLetters.find(e => operationEntityKey(e.operation) === key);
+      const old = failed ?? snapshot.queue.find(e => operationEntityKey(e.operation) === key);
+      const refreshed = old ? { ...entry, retry_count: old.retry_count, next_retry_at: old.next_retry_at, last_error: old.last_error } : entry;
+      if (failed) seededDeadLetters.push(refreshed);
+      return refreshed;
+    }).filter(entry => !seededDeadLetters.includes(entry));
+    const keep = (entry: SyncQueueEntry) => {
+      const key = operationEntityKey(entry.operation) ?? "";
+      return !replacedKeys.has(key) || (privateKeys.has(key) && entry.operation.kind === "note-delete" && !entries.some(e => operationEntityKey(e.operation) === key));
+    };
+    snapshot.queue = snapshot.queue.filter(keep);
+    snapshot.deadLetters = snapshot.deadLetters.filter(keep);
+    snapshot.deadLetters.push(...seededDeadLetters);
+    snapshot.protectedEntities = [...(snapshot.protectedEntities ?? []).filter((entity) => !replacedKeys.has(`${entity.kind}:${entity.id}`)), ...protectedEntities];
+    const known = new Set([...snapshot.queue, ...snapshot.deadLetters].map((entry) => entry.id));
+    for (const entry of importedEntries) {
+      if (!known.has(entry.id)) { snapshot.queue.push(entry); known.add(entry.id); }
+    }
+    snapshot.importedOutboxSequence = throughSequence;
   });
 }

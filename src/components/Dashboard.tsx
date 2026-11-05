@@ -47,10 +47,6 @@ import { useNotesWorkflow } from "@/hooks/useNotesWorkflow";
 import { useIsCompactLayout } from "@/hooks/useIsCompactLayout";
 import { useDetachedNotesBridge } from "@/hooks/useDetachedNotesBridge";
 import { useVoiceEdit } from "@/hooks/useVoiceEdit";
-import {
-  scheduleNoteUpdatePushFromDisk,
-  UPDATE_NOTE_PUSH_DEBOUNCE_MS,
-} from "@/lib/sync/notes-store";
 
 export default function Dashboard() {
   const { t } = useTranslation();
@@ -89,6 +85,7 @@ export default function Dashboard() {
     createNote,
     readNote,
     updateNote,
+    applySavedNoteMeta,
     deleteNote,
     searchNotes,
     toggleFavorite,
@@ -245,9 +242,7 @@ export default function Dashboard() {
   const handleDetachedUpdated = useCallback(
     (payload: { id: string; title: string; updatedAt: string }) => {
       applyExternalNoteMeta(payload.id, payload.title, payload.updatedAt);
-      // The detached window wrote the disk; the main window owns the sync
-      // queue and ships the coalesced state after the debounce window.
-      scheduleNoteUpdatePushFromDisk(payload.id, UPDATE_NOTE_PUSH_DEBOUNCE_MS);
+      // The ownership service already committed the durable sync intention.
     },
     [applyExternalNoteMeta],
   );
@@ -257,7 +252,8 @@ export default function Dashboard() {
       try {
         await toggleLocalOnly(id);
         const data = await readNote(id);
-        await emit("note-meta-updated", { meta: data.meta });
+        const session = await invoke<{profile_id:string;session_generation:number}>("get_profile_session");
+        await emit("note-meta-updated", { meta: data.meta,...session });
       } catch (e) {
         console.error("Failed to toggle local-only from detached window:", e);
       }
@@ -456,7 +452,7 @@ export default function Dashboard() {
               onOpenNoteInTab={handleOpenNoteInTabById}
               onCloseNote={handleCloseNoteTab}
               onDeleteNote={handleDeleteNote}
-              onUpdateNote={updateNote}
+              onNoteSaved={applySavedNoteMeta}
               onToggleLocalOnly={toggleLocalOnly}
               onCreateNote={() => handleCreateNoteFromSidebar(null)}
               onRecreateLinkedNote={handleRecreateLinkedNote}

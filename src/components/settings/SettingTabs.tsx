@@ -8,6 +8,7 @@ import { AppearanceSection } from "./sections/AppearanceSection";
 import { ShortcutsSection } from "./sections/ShortcutsSection";
 import { AboutSection } from "./sections/AboutSection";
 import { AccountSection } from "./sections/AccountSection";
+import { McpSection } from "./sections/McpSection";
 
 interface SettingTabsProps {
   activeSection: SettingsSectionId;
@@ -41,6 +42,7 @@ export function SettingTabs({ activeSection, onSectionChange }: SettingTabsProps
       {activeSection === "section-apparence" && <AppearanceSection />}
       {activeSection === "section-raccourcis" && <ShortcutsSection />}
       {activeSection === "section-compte" && <AccountSection />}
+      {activeSection === "section-integrations" && <McpSection />}
       {activeSection === "section-systeme" && <SystemSection />}
       {activeSection === "section-a-propos" && <AboutSection />}
     </div>

@@ -33,6 +33,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
+import { __resetForTests as resetQueueSession } from "./queue";
 import {
   createLocalBackup,
   restoreLocalBackup,
@@ -44,6 +45,7 @@ const invokeMock = vi.mocked(invoke);
 
 beforeEach(() => {
   invokeMock.mockReset();
+  resetQueueSession();
   for (const k of Object.keys(storeData)) delete storeData[k];
 });
 
@@ -140,6 +142,55 @@ describe("createLocalBackup", () => {
 // ── restoreLocalBackup ───────────────────────────────────────────────────────
 
 describe("restoreLocalBackup", () => {
+  it("pins the original profile session before reading a delayed backup and forwards it to every import", async () => {
+    const session = { profile_id: "work", session_generation: 7 };
+    let current = session;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "get_profile_session") return current;
+      if (command === "read_local_backup") {
+        current = { profile_id: "personal", session_generation: 8 };
+        return JSON.stringify({version:2,created_at:"now",tauri_stores:{},folders:[],notes:[{meta:{id:"a"},content:"backup"}]});
+      }
+      if (command.startsWith("import_")) return null;
+      throw Error(`unexpected ${command}`);
+    });
+    await restoreLocalBackup("backup.json");
+    expect(invokeMock.mock.calls[0][0]).toBe("get_profile_session");
+    expect(invokeMock).toHaveBeenCalledWith("import_note_for_backup", expect.objectContaining({session,source:"backup"}));
+    expect(invokeMock).toHaveBeenCalledWith("import_folders_for_backup", expect.objectContaining({session,source:"backup"}));
+  });
+  it("restores referenced folders before their notes on a fresh profile", async () => {
+    const payload: BackupPayloadV2 = {
+      version: 2,
+      created_at: "2026-11-05T10:00:00Z",
+      tauri_stores: {},
+      folders: [{ id: "folder", name: "Projects", createdAt: "c", updatedAt: "u", order: 0 }],
+      notes: [{ meta: { id: "note", title: "Project", folderId: "folder", createdAt: "c", updatedAt: "u", favorite: false, order: 0 }, content: "<p>Keep this</p>" }],
+    };
+    const folders = new Set<string>();
+    const persisted: string[] = [];
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "get_profile_session") return {profile_id:"work",session_generation:7};
+      if (command === "read_local_backup") return JSON.stringify(payload);
+      if (command === "import_folders_for_backup") {
+        for (const folder of (args as { folders: BackupPayloadV2["folders"] }).folders) folders.add(folder.id);
+        return;
+      }
+      if (command === "import_note_for_backup") {
+        const note = args as unknown as BackupPayloadV2["notes"][number];
+        if (note.meta.folderId && !folders.has(note.meta.folderId)) throw new Error("Folder not found");
+        persisted.push(note.content);
+        return;
+      }
+      throw new Error(`unexpected invoke: ${command}`);
+    });
+
+    const result = await restoreLocalBackup("profile.json");
+    expect(result.failed).toEqual([]);
+    expect(result.notes_restored).toBe(1);
+    expect(persisted).toEqual(["<p>Keep this</p>"]);
+  });
+
   it("v1 backup: restores stores only — no import_note / import_folders calls", async () => {
     const v1: BackupPayloadV1 = {
       version: 1,
@@ -147,6 +198,7 @@ describe("restoreLocalBackup", () => {
       tauri_stores: { "settings.json": { theme: "light" } },
     };
     invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_profile_session") return {profile_id:"work",session_generation:7};
       if (cmd === "read_local_backup") return JSON.stringify(v1);
       throw new Error(`unexpected invoke: ${cmd}`);
     });
@@ -180,6 +232,7 @@ describe("restoreLocalBackup", () => {
     };
 
     invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_profile_session") return {profile_id:"work",session_generation:7};
       if (cmd === "read_local_backup") return JSON.stringify(v2);
       if (cmd === "import_note_for_backup") return null;
       if (cmd === "import_folders_for_backup") return null;
@@ -221,6 +274,7 @@ describe("restoreLocalBackup", () => {
 
     invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
       const a = args as Record<string, unknown> | undefined;
+      if (cmd === "get_profile_session") return {profile_id:"work",session_generation:7};
       if (cmd === "read_local_backup") return JSON.stringify(v2);
       if (cmd === "import_note_for_backup") {
         const meta = a?.meta as { id: string };

@@ -1,10 +1,6 @@
-use std::fs;
 use tauri::{AppHandle, Manager};
 
-use crate::profiles::{
-    generate_unique_id, get_profile_dir, load_manifest, name_to_id, save_manifest, validate_profile_name,
-    ProfileMeta,
-};
+use crate::profiles::{load_manifest, ProfileMeta};
 
 /// List all profiles
 #[tauri::command]
@@ -49,10 +45,8 @@ pub fn get_active_profile_sync_meta_path(app: AppHandle) -> Result<String, Strin
 /// manifest so callers can't address a path outside the known profiles.
 #[tauri::command]
 pub fn get_profile_sync_meta_path(app: AppHandle, id: String) -> Result<String, String> {
-    let manifest = load_manifest(&app).map_err(|e| e.to_string())?;
-    if !manifest.profiles.iter().any(|p| p.id == id) {
-        return Err(format!("Profile '{}' not found.", id));
-    }
+    let _scope =
+        crate::note_service::ProfileScope::resolve(&app, &id).map_err(|e| e.to_string())?;
     Ok(crate::profiles::profile_store_path(&id, "sync-meta.json"))
 }
 
@@ -77,81 +71,40 @@ pub fn get_active_profile_dictionary_path(app: AppHandle) -> Result<String, Stri
 /// Create a new profile (does NOT switch to it)
 #[tauri::command]
 pub fn create_profile(app: AppHandle, name: String) -> Result<ProfileMeta, String> {
-    validate_profile_name(&name)?;
-
-    let mut manifest = load_manifest(&app).map_err(|e| e.to_string())?;
-
-    let base_id = name_to_id(name.trim());
-    if base_id.is_empty() {
-        return Err("Profile name must contain at least one alphanumeric character.".to_string());
-    }
-
-    let id = generate_unique_id(&base_id, &manifest.profiles);
-
-    // Create the profile directory
-    let profile_dir = get_profile_dir(&app, &id).map_err(|e| e.to_string())?;
-    fs::create_dir_all(&profile_dir)
-        .map_err(|e| format!("Failed to create profile directory: {}", e))?;
-
-    let meta = ProfileMeta {
-        id,
-        name: name.trim().to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-
-    manifest.profiles.push(meta.clone());
-    save_manifest(&app, &manifest).map_err(|e| e.to_string())?;
-
-    tracing::info!("Created profile: {} ({})", meta.name, meta.id);
-    Ok(meta)
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    crate::note_service::ProfileRegistry::create_in(&app_data, &name).map_err(|e| e.to_string())
 }
 
 /// Rename a profile (changes display name only, never renames the directory)
 #[tauri::command]
 pub fn rename_profile(app: AppHandle, id: String, new_name: String) -> Result<(), String> {
-    validate_profile_name(&new_name)?;
-
-    let trimmed_name = new_name.trim().to_string();
-    let mut manifest = load_manifest(&app).map_err(|e| e.to_string())?;
-
-    let profile = manifest
-        .profiles
-        .iter_mut()
-        .find(|p| p.id == id)
-        .ok_or_else(|| format!("Profile '{}' not found.", id))?;
-
-    profile.name = trimmed_name.clone();
-    save_manifest(&app, &manifest).map_err(|e| e.to_string())?;
-
-    tracing::info!("Renamed profile {} to: {}", id, trimmed_name);
-    Ok(())
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    crate::note_service::ProfileRegistry::rename_in(&app_data, &id, &new_name)
+        .map_err(|e| e.to_string())
 }
 
 /// Delete a profile (cannot delete the active profile or the last one)
 #[tauri::command]
 pub fn delete_profile(app: AppHandle, id: String) -> Result<(), String> {
-    let mut manifest = load_manifest(&app).map_err(|e| e.to_string())?;
-
-    if manifest.active == id {
-        return Err("Cannot delete the currently active profile. Switch to another profile first.".to_string());
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    let mcp = app.try_state::<crate::commands::mcp::LocalMcpState>();
+    #[cfg(windows)]
+    let _grant_change = mcp
+        .as_ref()
+        .map(|s| s.profile_changes.lock())
+        .transpose()
+        .map_err(|_| "Profile permission lock unavailable".to_string())?;
+    let result =
+        crate::note_service::ProfileRegistry::delete_in(&app_data, &id).map_err(|e| e.to_string());
+    #[cfg(windows)]
+    if let Some(mcp) = mcp.as_ref() {
+        // Directory removal may fail after the logical deletion was persisted.
+        if load_manifest(&app).is_ok_and(|m| !m.profiles.iter().any(|p| p.id == id)) {
+            mcp.grants.remove_profile(&id).map_err(|e| e.to_string())?;
+        }
     }
-
-    if manifest.profiles.len() <= 1 {
-        return Err("Cannot delete the last remaining profile.".to_string());
-    }
-
-    manifest.profiles.retain(|p| p.id != id);
-    save_manifest(&app, &manifest).map_err(|e| e.to_string())?;
-
-    // Remove the profile directory recursively
-    let profile_dir = get_profile_dir(&app, &id).map_err(|e| e.to_string())?;
-    if profile_dir.exists() {
-        fs::remove_dir_all(&profile_dir)
-            .map_err(|e| format!("Failed to delete profile directory: {}", e))?;
-    }
-
-    tracing::info!("Deleted profile: {}", id);
-    Ok(())
+    result
 }
 
 /// Switch to a different profile.
@@ -161,36 +114,27 @@ pub fn delete_profile(app: AppHandle, id: String) -> Result<(), String> {
 pub fn switch_profile(app: AppHandle, id: String) -> Result<(), String> {
     use tauri_plugin_store::StoreBuilder;
 
-    let mut manifest = load_manifest(&app).map_err(|e| e.to_string())?;
-
-    if !manifest.profiles.iter().any(|p| p.id == id) {
-        return Err(format!("Profile '{}' not found.", id));
-    }
-
-    // Close all detached note windows — they belong to the outgoing profile.
-    // close() is a request (async teardown), but a stray in-flight autosave is
-    // harmless: update_note rejects ids that don't exist in the (new) active
-    // profile, and note ids are UUIDs so cross-profile collisions can't occur.
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    // Capture + switch the registry under the shared lifecycle lock. An existing
+    // note transaction retains its captured profile; no temporary UI switch.
+    let state: tauri::State<crate::state::AppState> = app.state();
+    crate::note_service::ProfileRegistry::switch_with_preflight_in(
+        &app_data,
+        &id,
+        |_| {
+            let active = state.active_profile_id.lock().map_err(|_| {
+                crate::note_service::DomainError::Storage("Profile state lock unavailable".into())
+            })?;
+            let editors = crate::note_service::editors::editors().prepare_profile_switch()?;
+            Ok((active, editors))
+        },
+        |_, (mut active, editors)| {
+            editors.commit();
+            *active = id.clone();
+        },
+    )
+    .map_err(|e| e.to_string())?;
     crate::commands::window::close_all_note_windows(&app);
-
-    manifest.active = id.clone();
-    save_manifest(&app, &manifest).map_err(|e| e.to_string())?;
-
-    // Ensure the profile directory exists
-    let profile_dir = get_profile_dir(&app, &id).map_err(|e| e.to_string())?;
-    if !profile_dir.exists() {
-        fs::create_dir_all(&profile_dir)
-            .map_err(|e| format!("Failed to create profile directory: {}", e))?;
-    }
-
-    // Update active_profile_id in AppState immediately so all Rust commands
-    // use the new profile's paths from this point on.
-    {
-        let state: tauri::State<crate::state::AppState> = app.state();
-        if let Ok(mut guard) = state.active_profile_id.lock() {
-            *guard = id.clone();
-        };
-    }
 
     // Re-register hotkeys from the new profile's settings
     {
@@ -224,37 +168,38 @@ pub fn switch_profile(app: AppHandle, id: String) -> Result<(), String> {
 /// Set a profile's avatar from a PNG data-URL (validates profile + payload)
 #[tauri::command]
 pub fn set_profile_avatar(app: AppHandle, id: String, data_url: String) -> Result<(), String> {
-    let manifest = load_manifest(&app).map_err(|e| e.to_string())?;
-    if !crate::profiles::profile_exists(&manifest, &id) {
-        return Err(format!("Profile '{}' not found.", id));
-    }
     let bytes = crate::profiles::decode_avatar_data_url(&data_url)?;
-    let dir = get_profile_dir(&app, &id).map_err(|e| e.to_string())?;
-    crate::profiles::write_avatar_in(&dir, &bytes)?;
-    tracing::info!("Set avatar for profile: {}", id);
-    Ok(())
+    let scope = crate::note_service::ProfileScope::resolve(&app, &id).map_err(|e| e.to_string())?;
+    scope
+        .transaction(|profile| {
+            profile.path(std::path::Path::new("avatar.png"))?;
+            crate::profiles::write_avatar_in(scope.root(), &bytes)
+                .map_err(crate::note_service::DomainError::from)
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Get a profile's avatar as a PNG data-URL, or None if absent
 #[tauri::command]
 pub fn get_profile_avatar(app: AppHandle, id: String) -> Result<Option<String>, String> {
-    let manifest = load_manifest(&app).map_err(|e| e.to_string())?;
-    if !crate::profiles::profile_exists(&manifest, &id) {
-        return Err(format!("Profile '{}' not found.", id));
-    }
-    let dir = get_profile_dir(&app, &id).map_err(|e| e.to_string())?;
-    Ok(crate::profiles::read_avatar_data_url_in(&dir))
+    let scope = crate::note_service::ProfileScope::resolve(&app, &id).map_err(|e| e.to_string())?;
+    scope
+        .transaction(|profile| {
+            profile.path(std::path::Path::new("avatar.png"))?;
+            Ok(crate::profiles::read_avatar_data_url_in(scope.root()))
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Remove a profile's avatar (no-op if absent)
 #[tauri::command]
 pub fn clear_profile_avatar(app: AppHandle, id: String) -> Result<(), String> {
-    let manifest = load_manifest(&app).map_err(|e| e.to_string())?;
-    if !crate::profiles::profile_exists(&manifest, &id) {
-        return Err(format!("Profile '{}' not found.", id));
-    }
-    let dir = get_profile_dir(&app, &id).map_err(|e| e.to_string())?;
-    crate::profiles::clear_avatar_in(&dir)?;
-    tracing::info!("Cleared avatar for profile: {}", id);
-    Ok(())
+    let scope = crate::note_service::ProfileScope::resolve(&app, &id).map_err(|e| e.to_string())?;
+    scope
+        .transaction(|profile| {
+            profile.path(std::path::Path::new("avatar.png"))?;
+            crate::profiles::clear_avatar_in(scope.root())
+                .map_err(crate::note_service::DomainError::from)
+        })
+        .map_err(|e| e.to_string())
 }

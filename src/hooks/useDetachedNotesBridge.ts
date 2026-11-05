@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 
 export interface DetachedNotesBridgeHandlers {
   /** Rust `note-window-closed` — silent tab restore (native X). */
@@ -27,29 +28,35 @@ export function useDetachedNotesBridge(handlers: DetachedNotesBridgeHandlers) {
   handlersRef.current = handlers;
 
   useEffect(() => {
+    let disposed = false;
+    let session: {profile_id:string;session_generation:number} | null = null;
+    const ready = invoke<{profile_id:string;session_generation:number}>("get_profile_session").then(value => {session=value;});
+    const belongs = (payload:{profile_id?:string;session_generation?:number}) => !disposed && session && payload.profile_id === session.profile_id && payload.session_generation === session.session_generation;
+    type Scoped = {profile_id:string;session_generation:number};
     const unlistenPromises = [
-      listen<{ noteId: string }>("note-window-closed", (e) =>
-        handlersRef.current.onWindowClosed(e.payload.noteId),
-      ),
-      listen<{ id: string }>("note-reattach-request", (e) =>
-        handlersRef.current.onReattachRequest(e.payload.id),
-      ),
-      listen<{ id: string }>("note-open-request", (e) =>
-        handlersRef.current.onOpenRequest(e.payload.id),
-      ),
-      listen<{ id: string }>("note-detached-delete-request", (e) =>
-        handlersRef.current.onDeleteRequest(e.payload.id),
-      ),
-      listen<{ id: string; title: string; updatedAt: string }>(
+      ready.then(() => listen<Scoped & { noteId: string }>("note-window-closed", (e) => {
+        if (belongs(e.payload)) handlersRef.current.onWindowClosed(e.payload.noteId);
+      })),
+      ready.then(() => listen<Scoped & { id: string }>("note-reattach-request", (e) => {
+        if (belongs(e.payload)) handlersRef.current.onReattachRequest(e.payload.id);
+      })),
+      ready.then(() => listen<Scoped & { id: string }>("note-open-request", (e) => {
+        if (belongs(e.payload)) handlersRef.current.onOpenRequest(e.payload.id);
+      })),
+      ready.then(() => listen<Scoped & { id: string }>("note-detached-delete-request", (e) => {
+        if (belongs(e.payload)) handlersRef.current.onDeleteRequest(e.payload.id);
+      })),
+      ready.then(() => listen<Scoped & { id: string; title: string; updatedAt: string }>(
         "note-detached-updated",
-        (e) => handlersRef.current.onDetachedUpdated(e.payload),
-      ),
-      listen<{ id: string }>("note-toggle-local-only-request", (e) =>
-        handlersRef.current.onToggleLocalOnlyRequest(e.payload.id),
-      ),
+        (e) => {if (belongs(e.payload)) handlersRef.current.onDetachedUpdated(e.payload);},
+      )),
+      ready.then(() => listen<Scoped & { id: string }>("note-toggle-local-only-request", (e) => {
+        if (belongs(e.payload)) handlersRef.current.onToggleLocalOnlyRequest(e.payload.id);
+      })),
     ];
     return () => {
-      for (const p of unlistenPromises) void p.then((unlisten) => unlisten());
+      disposed = true;
+      for (const p of unlistenPromises) void p.then((unlisten) => unlisten()).catch(() => {});
     };
   }, []);
 }

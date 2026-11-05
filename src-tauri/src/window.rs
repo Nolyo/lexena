@@ -532,11 +532,13 @@ pub(crate) fn open_note_window(
     // and the main-window handler ignores ids absent from the registry.
     let app_handle = app.clone();
     let closed_note_id = note_id.to_string();
+    let opened_session = crate::note_service::editors::editors().window_session(&label);
     window.on_window_event(move |event| {
         if matches!(event, WindowEvent::Destroyed) {
+            crate::note_service::editors::editors().window_destroyed(&note_window_label(&closed_note_id));
             let _ = app_handle.emit(
                 "note-window-closed",
-                serde_json::json!({ "noteId": closed_note_id }),
+                serde_json::json!({ "noteId": closed_note_id, "profile_id":opened_session.as_ref().map(|s|&s.profile_id), "session_generation":opened_session.as_ref().map(|s|s.session_generation) }),
             );
         }
     });

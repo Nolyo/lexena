@@ -4,9 +4,9 @@
   "version": "3.2.2-beta.1",
   "identifier": "com.nolyo.lexena",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "pnpm mcp:bridge:build --debug && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build:desktop",
     "frontendDist": "../dist"
   },
   "app": {
@@ -37,6 +37,7 @@
     "active": true,
     "targets": ["nsis"],
     "createUpdaterArtifacts": true,
+    "externalBin": ["binaries/lexena-mcp"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

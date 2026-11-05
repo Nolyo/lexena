@@ -10,6 +10,7 @@ import { useDetachedNote } from "@/hooks/useDetachedNote";
 import { useNotesEditorInstance } from "@/hooks/useNotesEditorInstance";
 import { useLinkEditor } from "@/hooks/useLinkEditor";
 import { createNoteSynced } from "@/lib/sync/notes-store";
+import { getQueueSession } from "@/lib/sync/queue";
 import { type NoteMeta } from "@/hooks/useNotes";
 import { type Theme, DEFAULT_THEME } from "@/lib/theme";
 import { NoteLinkProvider } from "@/components/notes/NotesEditor/NoteLinkContext";
@@ -40,10 +41,7 @@ export function DetachedNoteShell({ noteId }: { noteId: string }) {
     folders,
     loadFailed,
     readNote,
-    handleUpdateNote,
-    markLocalEdit,
-    isQuiescent,
-    reloadFromDisk,
+    applySavedNoteMeta,
     requestReattach,
     requestDelete,
     requestToggleLocalOnly,
@@ -79,57 +77,26 @@ export function DetachedNoteShell({ noteId }: { noteId: string }) {
   linkRefsRef.current = { notes, activeNoteId: noteId };
   const getNoteLinkRefs = useRef(() => linkRefsRef.current).current;
 
-  const { editor, isLoadingContent, loadedNoteId, flushSave } =
+  const { editor, isLoadingContent, loadedNoteId, flushSave, closeEditor, saveError } =
     useNotesEditorInstance({
       openNotes,
       activeNoteId: meta ? noteId : null,
       readNote,
-      onUpdateNote: handleUpdateNote,
+      onNoteSaved: applySavedNoteMeta,
       getNoteLinkRefs,
     });
 
   const linkEditor = useLinkEditor(editor);
 
-  // Track local typing so a remote reload never clobbers in-flight edits.
+  // Wait for a confirmed save before the native webview can disappear.
   useEffect(() => {
-    if (!editor) return;
-    editor.on("update", markLocalEdit);
-    return () => {
-      editor.off("update", markLocalEdit);
-    };
-  }, [editor, markLocalEdit]);
-
-  // A sync pull rewrote this note on disk: reload when quiescent, otherwise
-  // keep local edits (next save wins via LWW — spec §5).
-  useEffect(() => {
-    const unlistenPromise = listen<{ id: string }>(
-      "note-remote-updated",
-      async (event) => {
-        if (event.payload.id !== noteId || !editor) return;
-        if (!isQuiescent()) return;
-        const data = await reloadFromDisk();
-        if (data) {
-          editor.commands.setContent(data.content, { emitUpdate: false });
-        }
-      },
-    );
-    return () => {
-      void unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, [noteId, editor, isQuiescent, reloadFromDisk]);
-
-  // The native X is the canonical reattach gesture (spec §4): flush the
-  // pending debounced save before teardown so the restored tab always has
-  // the final keystrokes. The invoke is dispatched before the webview dies;
-  // Rust completes the disk write regardless.
-  useEffect(() => {
-    const unlistenPromise = getCurrentWindow().onCloseRequested(() => {
-      flushSave();
+    const win = getCurrentWindow();
+    const subscription = win.onCloseRequested(event => {
+      event.preventDefault();
+      void closeEditor().then(() => win.destroy()).catch(() => {});
     });
-    return () => {
-      void unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, [flushSave]);
+    return () => { void subscription.then(unlisten => unlisten()); };
+  },[closeEditor]);
 
   const togglePin = useCallback(async () => {
     const next = !pinned;
@@ -170,9 +137,7 @@ export function DetachedNoteShell({ noteId }: { noteId: string }) {
     const { title, onResolved } = brokenDialog;
     setBrokenDialog(null);
     try {
-      // createNoteSynced is a bare invoke("create_note") passthrough here:
-      // its enqueue path is gated by isSyncActive(), never true in this
-      // provider-less webview — the main window stays the sole sync owner.
+      const session = await getQueueSession();
       const created = await createNoteSynced(null);
       const safeTitle = title
         .replace(/&/g, "&amp;")
@@ -182,14 +147,16 @@ export function DetachedNoteShell({ noteId }: { noteId: string }) {
         id: created.id,
         content: `<h1>${safeTitle}</h1><p></p>`,
         title: title || created.title,
+        session,
       });
       await emit("note-detached-updated", {
+        ...session,
         id: seeded.id,
         title: seeded.title,
         updatedAt: seeded.updatedAt,
       });
       onResolved(created.id);
-      flushSave();
+      await flushSave();
       openNoteInMain(created.id);
     } catch (e) {
       console.error("[note-window] failed to recreate linked note:", e);
@@ -244,8 +211,7 @@ export function DetachedNoteShell({ noteId }: { noteId: string }) {
             onClick={() => {
               // Flush the pending debounced save before the main window
               // closes this window and re-reads the note from disk.
-              flushSave();
-              requestReattach();
+              void flushSave().then(requestReattach).catch(() => {});
             }}
             title={t("notes.detach.reattach")}
             aria-label={t("notes.detach.reattach")}
@@ -253,6 +219,8 @@ export function DetachedNoteShell({ noteId }: { noteId: string }) {
             <ArrowLeftToLine className="w-3.5 h-3.5" />
           </button>
         </div>
+
+        {saveError && <div className="notes-error-banner" role="alert">{saveError}</div>}
 
         <NotesEditorContent
           editor={editor}
@@ -282,7 +250,7 @@ export function DetachedNoteShell({ noteId }: { noteId: string }) {
           onOpenChange={setConfirmDeleteOpen}
           onConfirm={() => {
             setConfirmDeleteOpen(false);
-            requestDelete();
+            void flushSave().then(requestDelete).catch(() => {});
           }}
         />
 

@@ -9,14 +9,17 @@ import type { ProfileMeta } from "@/contexts/ProfilesContext";
 export async function ensureCloudProfileId(
   getMeta: <T>(k: string, d: T) => Promise<T>,
   setMeta: (k: string, v: unknown) => Promise<void>,
+  capturedProfileId?: string,
 ): Promise<{ id: string; name: string }> {
   let id = await getMeta<string | null>("cloud_profile_id", null);
   if (!id) {
     id = crypto.randomUUID();
     await setMeta("cloud_profile_id", id);
   }
-  const activeId = await invoke<string>("get_active_profile");
+  const activeId = capturedProfileId ?? await invoke<string>("get_active_profile");
   const profiles = await invoke<ProfileMeta[]>("list_profiles");
-  const name = profiles.find((p) => p.id === activeId)?.name ?? "Profil";
+  const local = profiles.find((p) => p.id === activeId);
+  if (capturedProfileId && !local) throw new Error("EDITOR_SESSION_EXPIRED");
+  const name = local?.name ?? "Profil";
   return { id, name };
 }

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Store } from "@tauri-apps/plugin-store";
+import { getQueueSession } from "./queue";
 
 export interface BackupMeta {
   filename: string;
@@ -160,14 +161,15 @@ export async function deleteLocalBackup(filename: string): Promise<void> {
  * Stratégie pour limiter les casses en cas d'échec partiel :
  *  1. Tauri Stores : on set d'abord toutes les clés du backup (si crash après set / avant delete,
  *     on a un superset stale plutôt qu'un store vidé). Puis on supprime les clés absentes.
- *  2. Notes : un try/catch par note pour qu'une note corrompue ne bloque pas les autres.
- *  3. Folders : ré-écriture atomique du fichier `folders.json` complet (commande unique). */
+ *  2. Folders : restaurés avant les notes qui les référencent.
+ *  3. Notes : un try/catch par note pour qu'une note corrompue ne bloque pas les autres. */
 export async function restoreLocalBackup(filename: string): Promise<{
   restored: string[];
   failed: Array<{ file: string; error: string }>;
   notes_restored: number;
   folders_restored: number;
 }> {
+  const session = await getQueueSession();
   const payload = await readLocalBackup(filename);
   const restored: string[] = [];
   const failed: Array<{ file: string; error: string }> = [];
@@ -207,12 +209,26 @@ export async function restoreLocalBackup(filename: string): Promise<{
   const notes = "notes" in payload && Array.isArray(payload.notes) ? payload.notes : null;
   const folders = "folders" in payload && Array.isArray(payload.folders) ? payload.folders : null;
 
+  if (folders) {
+    try {
+      await invoke("import_folders_for_backup", { folders, source: "backup", session });
+      folders_restored = folders.length;
+    } catch (e) {
+      failed.push({
+        file: "folders.json",
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
   if (notes) {
     for (const note of notes) {
       try {
         await invoke("import_note_for_backup", {
           meta: note.meta,
           content: note.content,
+          source: "backup",
+          session,
         });
         notes_restored++;
       } catch (e) {
@@ -221,18 +237,6 @@ export async function restoreLocalBackup(filename: string): Promise<{
           error: e instanceof Error ? e.message : String(e),
         });
       }
-    }
-  }
-
-  if (folders) {
-    try {
-      await invoke("import_folders_for_backup", { folders });
-      folders_restored = folders.length;
-    } catch (e) {
-      failed.push({
-        file: "folders.json",
-        error: e instanceof Error ? e.message : String(e),
-      });
     }
   }
 
