@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 
-const invokeMock = vi.fn(async (cmd: string) => {
+const invokeMock = vi.fn(async (cmd: string): Promise<unknown> => {
   if (cmd === "get_active_profile") return "default";
   if (cmd === "list_profiles")
     return [{ id: "default", name: "Perso", createdAt: "" }];
@@ -46,5 +46,14 @@ describe("ensureCloudProfileId", () => {
 
     const result = await ensureCloudProfileId(getMeta, setMeta);
     expect(result.name).toBe("Profil");
+  });
+  it("uses the captured profile rather than a later active profile", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "get_active_profile") throw Error("active lookup must not happen");
+      if (cmd === "list_profiles") return [{ id: "work", name: "Work", createdAt: "" }, { id: "personal", name: "Personal", createdAt: "" }];
+      throw Error(cmd);
+    });
+    expect(await ensureCloudProfileId(async <T,>(_key: string, fallback: T) => fallback, async () => {}, "work")).toEqual({ id: expect.any(String), name: "Work" });
+    await expect(ensureCloudProfileId(async <T,>(_key: string, fallback: T) => fallback, async () => {}, "deleted")).rejects.toThrow("EDITOR_SESSION_EXPIRED");
   });
 });

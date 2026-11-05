@@ -26,32 +26,45 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm test:mcp-packaging
+      - run: pnpm mcp:packaging:check
       - run: pnpm test
+      - run: pnpm build
 
   cargo-test:
     name: Rust tests (cargo test)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
-      - name: Install build deps (libclang, cmake + tauri linux deps)
+      - name: Configure native Windows build dependencies
+        shell: pwsh
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libclang-dev clang cmake \
-            libwebkit2gtk-4.1-dev libsoup-3.0-dev \
-            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
-            libglib2.0-dev pkg-config \
-            libasound2-dev libxdo-dev libssl-dev
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+      - name: Portable ZIP, manifest and packaging tests on Windows
+        run: pnpm test:mcp-packaging
+      - name: Standalone IPC and bridge tests (locked)
+        run: |
+          cargo test --locked --manifest-path src-tauri/crates/mcp-ipc/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --manifest-path src-tauri/crates/mcp-bridge/Cargo.toml
+      - name: Stage exact Windows sidecar before Tauri build script
+        run: pnpm mcp:bridge:build --target x86_64-pc-windows-msvc
       - name: cargo test (no-default-features, skip vulkan)
         working-directory: src-tauri
         env:
           CARGO_TARGET_DIR: target
-        run: cargo test --no-default-features --lib
+        run: cargo test --locked --no-default-features --lib
 
   deno-test:
     name: Edge functions tests (Deno)

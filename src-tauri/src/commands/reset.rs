@@ -1,4 +1,4 @@
-use std::fs;
+use crate::note_service::ProfileRegistry;
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
@@ -20,25 +20,28 @@ pub async fn reset_app_data(app_handle: AppHandle, confirmation: String) -> Resu
         .app_data_dir()
         .map_err(|e| format!("Could not resolve app data directory: {}", e))?;
 
+    let app_data =
+        ProfileRegistry::checked_reset_target_in(&app_data).map_err(|e| e.to_string())?;
     tracing::warn!("Resetting all app data at {}", app_data.display());
 
-    if app_data.exists() {
-        let entries = fs::read_dir(&app_data)
-            .map_err(|e| format!("Failed to read app data directory: {}", e))?;
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let result = if path.is_dir() {
-                fs::remove_dir_all(&path)
-            } else {
-                fs::remove_file(&path)
-            };
-
-            if let Err(e) = result {
-                tracing::warn!("Failed to remove {}: {}", path.display(), e);
-            }
-        }
-    }
+    // First close MCP admission, drain already-started disk jobs, and stop the
+    // listener. No registry/editor guard may cross this await.
+    #[cfg(windows)]
+    crate::mcp::lifecycle::stop(&app_handle)
+        .await
+        .map_err(|e| {
+            format!(
+                "Reset stopped before deletion: {e}. Restart the application before continuing."
+            )
+        })?;
+    // Keep MCP and native profile work disabled even if deletion fails. Never
+    // resume services over a partly erased profile; recovery is a process restart.
+    tauri::async_runtime::spawn_blocking(move || {
+        ProfileRegistry::reset_app_data_in(&app_data, crate::note_service::editors::editors())
+    })
+    .await
+    .map_err(|e| format!("Reset failed: {e}. Restart the application before continuing."))?
+    .map_err(|e| format!("Reset failed: {e}. Restart the application before continuing."))?;
 
     tracing::info!("App data wiped, scheduling restart");
 

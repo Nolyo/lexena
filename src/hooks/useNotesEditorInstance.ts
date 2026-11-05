@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { EditorOwnership, type EditorContext, type EditorRead } from "@/lib/notes/editor-ownership";
 import { useEditor, ReactNodeViewRenderer } from "@tiptap/react";
 import { CodeBlockLanguageSelect } from "@/components/notes/NotesEditor/CodeBlockLanguageSelect";
 import StarterKit from "@tiptap/starter-kit";
@@ -43,7 +46,7 @@ interface UseNotesEditorInstanceOptions {
   openNotes: NoteMeta[];
   activeNoteId: string | null;
   readNote: (id: string) => Promise<NoteData>;
-  onUpdateNote: (id: string, content: string, title: string) => void;
+  onNoteSaved: (meta: NoteMeta) => void;
   /**
    * Returns the *current* notes list + active note id for the @-suggestion
    * popup. Must stay identity-stable across renders; internally we read from
@@ -61,15 +64,14 @@ interface UseNotesEditorInstanceOptions {
  * - Configures StarterKit (with inline-safe Link), Image, Placeholder, TaskList
  * - Handles image paste/drop by reading files as data URIs
  * - Opens Ctrl+clicked links externally via `@tauri-apps/plugin-opener`
- * - Debounces `onUpdateNote` (500 ms) and derives the title from the HTML
- * - Loads note content on active-note change, resets the loaded ref when
- *   the tab is closed, and flushes pending saves on unmount
+ * - Registers a profile/session/revision-bound owner before loading content
+ * - Sets the dirty barrier synchronously and debounces revision-checked saves
+ * - Retains drafts and blocks ownership transfer when persistence fails
  */
 export function useNotesEditorInstance({
   openNotes,
   activeNoteId,
-  readNote,
-  onUpdateNote,
+  onNoteSaved,
   getNoteLinkRefs,
   onContentSaved,
 }: UseNotesEditorInstanceOptions) {
@@ -80,9 +82,13 @@ export function useNotesEditorInstance({
   // this, clicking a tab shows the previous note's title/word-count for one
   // paint because `activeNoteId` flips before `readNote()` resolves.
   const [loadedNoteId, setLoadedNoteId] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const ownershipRef = useRef<EditorOwnership | null>(null);
+  const transitionRef = useRef<Promise<void>>(Promise.resolve());
+  const sessionRef = useRef<Promise<{profile_id:string;session_generation:number}> | null>(null);
+  const callbacksRef = useRef({onNoteSaved,onContentSaved});
+  callbacksRef.current = {onNoteSaved,onContentSaved};
   const saveTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const activeNoteIdRef = useRef(activeNoteId);
-  const loadedNoteIdRef = useRef<string | null>(null);
 
   // `handleImageFile` needs the editor instance, but the editor's
   // editorProps closures below reference it before it is defined. Using a
@@ -228,14 +234,13 @@ export function useNotesEditorInstance({
     },
     onUpdate: ({ editor }) => {
       clearTimeout(saveTimerRef.current);
-      const noteId = activeNoteIdRef.current;
+      const owner = ownershipRef.current;
+      if (!owner) return;
+      // The renderer barrier is synchronous; IPC is dispatched before debounce.
+      owner.change(editor.getHTML());
       saveTimerRef.current = setTimeout(() => {
-        if (noteId) {
-          const html = editor.getHTML();
-          const title = deriveTitle(html);
-          onUpdateNote(noteId, html, title);
-          onContentSaved?.();
-        }
+        saveTimerRef.current = undefined;
+        void owner.flush().catch(() => {});
       }, 500);
     },
   });
@@ -258,80 +263,136 @@ export function useNotesEditorInstance({
     reader.readAsDataURL(file);
   };
 
-  // Load content when active note changes
+  // Every delayed operation carries the session captured by this renderer.
+  // Switching tabs waits for a confirmed save; a failure keeps the visible draft.
   useEffect(() => {
-    activeNoteIdRef.current = activeNoteId;
-
-    if (!activeNoteId || !editor) return;
-
-    // Don't reload if already loaded
-    if (loadedNoteIdRef.current === activeNoteId) return;
-
-    setIsLoadingContent(true);
-    // Clear the loaded flag so consumers don't trust the editor's document
-    // while it still holds the previous note's content.
-    setLoadedNoteId(null);
-    readNote(activeNoteId)
-      .then((data) => {
-        // Swap empty/blank content for a title+body scaffold so new users
-        // discover the "first line = title" convention visually. The seed
-        // contains no text nodes, so `getText()` stays empty and the
-        // auto-delete-on-close-empty policy is untouched.
-        const blank = isBlankContent(data.content);
-        const content = blank ? EMPTY_NOTE_SEED : data.content;
-        // `emitUpdate: false` is critical: TipTap v3 defaults to emitting an
-        // update event on setContent, which would schedule a debounced save
-        // right after loading — re-writing the just-read content to disk and
-        // potentially clobbering attributes that weren't round-tripped cleanly.
-        editor.commands.setContent(content, { emitUpdate: false });
-        // Drop the caret inside the empty H1 so the user can start typing
-        // a title immediately. `focus()` emits selectionUpdate, not update,
-        // so it doesn't trigger a save.
-        if (blank) {
-          editor.commands.focus("start");
-        }
-        loadedNoteIdRef.current = activeNoteId;
-        setLoadedNoteId(activeNoteId);
-      })
-      .catch((err) => {
-        console.error("Failed to load note:", err);
-        editor.commands.setContent("", { emitUpdate: false });
-      })
-      .finally(() => setIsLoadingContent(false));
-  }, [activeNoteId, editor, readNote]);
-
-  // Reset loaded note when tab is closed
-  useEffect(() => {
-    const openIds = new Set(openNotes.map((n) => n.id));
-    if (loadedNoteIdRef.current && !openIds.has(loadedNoteIdRef.current)) {
-      loadedNoteIdRef.current = null;
-      setLoadedNoteId(null);
-    }
-  }, [openNotes]);
-
-  // Flush pending save on unmount
-  useEffect(() => {
-    return () => {
+    if (!editor) return;
+    let cancelled = false;
+    sessionRef.current ??= invoke("get_profile_session");
+    const sessionPromise = sessionRef.current;
+    const transition = transitionRef.current.then(async () => {
+      if (cancelled) return;
+      const previous = ownershipRef.current;
+      if (previous?.context.note_id === activeNoteId) {
+        // A canceled switch may have failed to close this owner. Its finally
+        // cannot clear loading; expose the retained draft without clearing
+        // the save error or re-enabling an owner with a persistence failure.
+        setIsLoadingContent(false);
+        return;
+      }
       clearTimeout(saveTimerRef.current);
-    };
-  }, []);
+      editor.setEditable(false);
+      setIsLoadingContent(true);
+      try {
+        if (previous) {
+          await previous.close();
+          if (ownershipRef.current === previous) ownershipRef.current = null;
+        }
+        if (cancelled) return;
+        if (!activeNoteId) {
+          setLoadedNoteId(null);
+          return;
+        }
+        const session = await sessionPromise;
+        if (cancelled) return;
+        const data = await invoke<EditorRead>("register_note_editor", {
+          noteId: activeNoteId, editorId: crypto.randomUUID(), session,
+        });
+        if (cancelled) {
+          await invoke("end_note_edit", {context:data.context});
+          return;
+        }
+        const draftKey = (context:EditorContext) => `lexena:note-draft:${context.profile_id}:${context.note_id}`;
+        const load = (content:string) => editor.commands.setContent(isBlankContent(content) ? EMPTY_NOTE_SEED : content,{emitUpdate:false});
+        const owner = new EditorOwnership(data.context,data.note.content,{
+          begin:context => invoke("begin_note_edit",{context}),
+          save:(context,content) => invoke<EditorRead>("save_editor_note",{context,content,title:deriveTitle(content),operationId:crypto.randomUUID()}),
+          ack:(context,prepareId,dirty) => invoke("ack_editor_prepare",{context,prepareId,dirty}),
+          read:context => invoke<EditorRead>("read_editor_note",{context}),
+          end:context => invoke("end_note_edit",{context}),
+        },{
+          setEditable:value => editor.setEditable(value),
+          load,
+          conflict:error => {
+            console.error("Note draft retained:",error);
+            setSaveError(i18n.t("notes.editor.saveConflict",{defaultValue:"Votre brouillon est conservé. La note a changé ou la sauvegarde a échoué. Copiez votre texte avant de fermer cet éditeur."}));
+          },
+          persist:(context,content) => {
+            // A crash or rejected close must preserve the last keystroke.
+            try {
+              if (content === null) localStorage.removeItem(draftKey(context));
+              else localStorage.setItem(draftKey(context),JSON.stringify({content,revision:context.loaded_revision}));
+            } catch (error) { console.error("Draft recovery storage unavailable",error); }
+          },
+          saved:saved => {
+            callbacksRef.current.onNoteSaved(saved.note.meta as unknown as NoteMeta);
+            callbacksRef.current.onContentSaved?.();
+          },
+        });
+        ownershipRef.current = owner;
+        setSaveError(null);
+        const draft = localStorage.getItem(draftKey(data.context));
+        if (draft) {
+          try {
+            const stored:unknown = JSON.parse(draft);
+            if (stored && typeof stored === "object" && "content" in stored && "revision" in stored && typeof stored.content === "string" && typeof stored.revision === "string") {
+              owner.restoreDraft(stored.content,stored.revision);
+            }
+          } catch (error) { console.error("Failed to recover note draft",error); }
+        }
+        load(owner.content);
+        setLoadedNoteId(activeNoteId);
+        editor.setEditable(!owner.conflicted);
+        if (!owner.conflicted && isBlankContent(owner.content)) editor.commands.focus("start");
+      } catch (error) {
+        console.error("Failed to switch note editor:",error);
+        setSaveError(i18n.t("notes.editor.saveConflict",{defaultValue:"Votre brouillon est conservé. La sauvegarde a échoué ; copiez votre texte avant de fermer cet éditeur."}));
+        // The previous editor and draft stay in place when flush/close fails.
+      } finally { if (!cancelled) setIsLoadingContent(false); }
+    });
+    transitionRef.current = transition.catch(() => {});
+    return () => { cancelled = true; };
+  }, [activeNoteId,editor]);
 
-  // Synchronously cancel any pending debounced save and write the current
-  // editor HTML to disk under the active note id. Needed before swapping the
-  // active note (e.g. recreate-from-broken-link flow) so the pending write
-  // isn't replaced by the new note's content when the timer fires.
-  const flushSave = useCallback(() => {
-    if (!saveTimerRef.current) return;
+  useEffect(() => {
+    const matches = (context:EditorContext) => {
+      const owner = ownershipRef.current;
+      return owner && owner.context.editor_id === context.editor_id && owner.context.profile_id === context.profile_id && owner.context.session_generation === context.session_generation ? owner : null;
+    };
+    const subscriptions = [
+      listen<{context:EditorContext;prepare_id:string}>("note-editor-prepare",event => {
+        void matches(event.payload.context)?.prepare(event.payload.prepare_id).catch(() => {});
+      }),
+      listen<{context:EditorContext;prepare_id:string;committed:boolean}>("note-editor-resume",event => {
+        void matches(event.payload.context)?.resume(event.payload.prepare_id,event.payload.committed);
+      }),
+      listen<{profile_id:string;note_id:string}>("note-service-changed",event => {
+        const owner = ownershipRef.current;
+        if (owner && owner.context.profile_id === event.payload.profile_id && owner.context.note_id === event.payload.note_id) void owner.refresh();
+      }),
+    ];
+    return () => { for (const subscription of subscriptions) void subscription.then(unlisten => unlisten()); };
+  },[]);
+
+  useEffect(() => () => {
+    clearTimeout(saveTimerRef.current);
+    const owner = ownershipRef.current;
+    if (owner) void owner.close().catch(error => console.error("Unsaved note draft retained",error));
+  },[]);
+
+  const flushSave = useCallback(async () => {
     clearTimeout(saveTimerRef.current);
     saveTimerRef.current = undefined;
-    const noteId = activeNoteIdRef.current;
-    if (noteId && editor) {
-      const html = editor.getHTML();
-      const title = deriveTitle(html);
-      onUpdateNote(noteId, html, title);
-      onContentSaved?.();
-    }
-  }, [editor, onUpdateNote, onContentSaved]);
+    await ownershipRef.current?.flush();
+  },[]);
+  const closeEditor = useCallback(async () => {
+    clearTimeout(saveTimerRef.current);
+    const owner = ownershipRef.current;
+    await owner?.close();
+    if (ownershipRef.current === owner) ownershipRef.current = null;
+  },[]);
 
-  return { editor, isLoadingContent, loadedNoteId, flushSave };
+  // openNotes remains part of the shared main/detached hook contract.
+  void openNotes;
+  return {editor,isLoadingContent,loadedNoteId,flushSave,closeEditor,saveError};
 }

@@ -8,10 +8,16 @@
  *   - src-tauri/target/release/    (Tauri binary + bundles)
  */
 
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
 import { join } from 'node:path';
 
-const ROOTS = ['dist', 'src-tauri/target/release'];
+const ROOTS = [];
+for (let index = 2; index < process.argv.length; index++) {
+  if (process.argv[index] !== '--root' || !process.argv[index + 1]) throw Error('Expected --root <directory>');
+  ROOTS.push(process.argv[++index]);
+}
+if (!ROOTS.length) ROOTS.push('dist', 'src-tauri/target/release');
 
 // Patterns sensibles. Toute correspondance = build cassé.
 const PATTERNS = [
@@ -24,9 +30,6 @@ const PATTERNS = [
   // Lemon Squeezy API key (préfixe documenté)
   { name: 'lemonsqueezy-api-key', re: /lsq_[A-Za-z0-9]{20,}/g },
 ];
-
-// Extensions à ouvrir en mode texte.
-const TEXT_EXTS = new Set(['.js', '.mjs', '.cjs', '.ts', '.html', '.css', '.json', '.map', '.txt', '.md', '.yml', '.yaml']);
 
 let findings = [];
 
@@ -51,24 +54,20 @@ async function walk(dir) {
 }
 
 async function scanFile(p) {
-  const ext = p.slice(p.lastIndexOf('.')).toLowerCase();
-  const s = await stat(p);
-  if (s.size > 50 * 1024 * 1024) return; // skip > 50 MB
-  const isText = TEXT_EXTS.has(ext);
-  let buf;
-  try {
-    buf = await readFile(p);
-  } catch {
-    return;
-  }
-  // Pour les binaires, on fait un scan ASCII brut (string search).
-  const content = isText ? buf.toString('utf8') : buf.toString('binary');
-  for (const { name, re } of PATTERNS) {
-    re.lastIndex = 0;
-    const m = content.match(re);
-    if (m) {
-      findings.push({ file: p, pattern: name, count: m.length });
+  // All secret patterns are ASCII. Stream large native executables rather than
+  // silently skipping them; retain a suffix for tokens crossing chunk boundaries.
+  let tail = '';
+  const found = new Set();
+  for await (const chunk of createReadStream(p, { highWaterMark: 64 * 1024 })) {
+    const content = tail + chunk.toString('latin1');
+    for (const { name, re } of PATTERNS) {
+      re.lastIndex = 0;
+      if (!found.has(name) && re.test(content)) {
+        findings.push({ file: p, pattern: name, count: 1 });
+        found.add(name);
+      }
     }
+    tail = content.slice(-4096);
   }
 }
 

@@ -1,0 +1,7 @@
+[
+  { "html": "<h1>Bonjour <strong>monde</strong></h1><p>Suite</p>", "locale": "fr", "title": "Bonjour monde" },
+  { "html": "<p></p><h1>Research &amp; notes</h1>", "locale": "en", "title": "Research & notes" },
+  { "html": "<p></p>", "locale": "fr", "title": "Note sans titre" },
+  { "html": "", "locale": "en", "title": "Untitled note" },
+  { "html": "<h1>研究 😀</h1><p>autre ligne</p>", "locale": "fr", "title": "研究 😀" }
+]

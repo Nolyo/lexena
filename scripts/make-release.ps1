@@ -76,7 +76,7 @@ Write-Ok "Working tree is clean"
 
 Write-Step "Bumping version in source files"
 
-$filesToBump = @("package.json", "src-tauri\Cargo.toml", "src-tauri\tauri.conf.json")
+$filesToBump = @("package.json", "src-tauri\Cargo.toml", "src-tauri\tauri.conf.json", "src-tauri\crates\mcp-bridge\Cargo.toml")
 
 # Read current version from package.json
 $packageJson = Get-Content "package.json" -Raw
@@ -97,7 +97,7 @@ if ($alreadyBumped) {
         $updated = $content -replace [regex]::Escape("`"version`": `"$currentVersion`""), "`"version`": `"$Version`""
 
         # Cargo.toml uses a different format for the top-level version line
-        if ($file -eq "src-tauri\Cargo.toml") {
+        if ($file -like "*Cargo.toml") {
             $updated = $content -replace "(?m)^version = `"$([regex]::Escape($currentVersion))`"", "version = `"$Version`""
         }
 
@@ -112,6 +112,9 @@ if ($alreadyBumped) {
     # ── Step 4: Update Cargo.lock ──────────────────────────────────────────────────
 
     Write-Step "Updating Cargo.lock"
+
+    cargo update --workspace --manifest-path src-tauri/crates/mcp-bridge/Cargo.toml
+    if ($LASTEXITCODE -ne 0) { Write-Fail "Could not update standalone MCP bridge lockfile" }
 
     $origLibclang = $env:LIBCLANG_PATH
     $origPath     = $env:PATH
@@ -140,7 +143,9 @@ if ($alreadyBumped) {
 
     Write-Step "Committing version bump"
 
-    git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock
+    node scripts/build-mcp-bridge.mjs --check
+    if ($LASTEXITCODE -ne 0) { Write-Fail "Application/bridge versions disagree" }
+    git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock src-tauri/crates/mcp-bridge/Cargo.toml src-tauri/crates/mcp-bridge/Cargo.lock
     if ($LASTEXITCODE -ne 0) { Write-Fail "git add failed" }
 
     $commitMsg = "chore: bump version to $Version"

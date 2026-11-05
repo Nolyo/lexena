@@ -1,40 +1,18 @@
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
+use crate::commands::note_editors::mutate_ui;
+use crate::note_service::editors::ProfileSession;
+#[cfg(test)]
+use crate::note_service::repository::is_note_active;
+pub use crate::note_service::repository::{NoteData, NoteMeta};
+use crate::note_service::{
+    Actor, MutationIntent, MutationResult, NoteRepository, NoteService, ProfileScope,
+};
+use anyhow::Result;
+use serde::Deserialize;
 use tauri::AppHandle;
+use tauri::WebviewWindow;
 use tauri_plugin_store::StoreBuilder;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NoteMeta {
-    pub id: String,
-    pub title: String,
-    pub created_at: String,
-    pub updated_at: String,
-    #[serde(default)]
-    pub favorite: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub folder_id: Option<String>,
-    #[serde(default)]
-    pub order: i32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deleted_at: Option<String>,
-    #[serde(default)]
-    pub local_only: bool,
-}
-
 /// Pure helper: a note is "active" (visible to the user) when it has not been soft-deleted.
-fn is_note_active(meta: &NoteMeta) -> bool {
-    meta.deleted_at.is_none()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NoteData {
-    pub meta: NoteMeta,
-    pub content: String,
-}
 
 /// Legacy note format stored in settings.json
 #[derive(Debug, Deserialize)]
@@ -48,16 +26,6 @@ struct LegacyNote {
 }
 
 /// Get the notes directory for the active profile, creating it if needed
-fn get_notes_dir(app_handle: &AppHandle) -> Result<PathBuf> {
-    let profile_dir = crate::profiles::get_active_profile_dir(app_handle)
-        .context("Could not resolve active profile directory")?;
-    let notes_dir = profile_dir.join("notes");
-    if !notes_dir.exists() {
-        fs::create_dir_all(&notes_dir)
-            .with_context(|| format!("Failed to create notes directory: {}", notes_dir.display()))?;
-    }
-    Ok(notes_dir)
-}
 
 /// Canonical UUID shape (8-4-4-4-12 hex groups). Note ids become window
 /// labels (`note-<id>`), which only accept [a-zA-Z0-9\-/:_] — rejecting
@@ -72,36 +40,14 @@ pub(crate) fn is_valid_note_id(id: &str) -> bool {
 
 /// True when the note exists on disk for the active profile.
 pub(crate) fn note_exists(app_handle: &AppHandle, id: &str) -> bool {
-    match get_notes_dir(app_handle) {
-        Ok(dir) => dir.join(id).join("note.json").exists(),
-        Err(_) => false,
-    }
+    ProfileScope::active(app_handle)
+        .and_then(|s| NoteRepository::get(&s, id))
+        .is_ok()
 }
 
 /// Read note metadata from a note directory
-fn read_note_meta(note_dir: &PathBuf) -> Result<NoteMeta> {
-    let meta_path = note_dir.join("note.json");
-    let content = fs::read_to_string(&meta_path)
-        .with_context(|| format!("Failed to read {}", meta_path.display()))?;
-    let meta: NoteMeta =
-        serde_json::from_str(&content).with_context(|| "Failed to parse note.json")?;
-    Ok(meta)
-}
 
 /// Strip HTML tags for search purposes
-fn strip_html_tags(html: &str) -> String {
-    let mut result = String::with_capacity(html.len());
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => result.push(ch),
-            _ => {}
-        }
-    }
-    result
-}
 
 /// Convert plain text to basic HTML paragraphs (for migration)
 fn text_to_html(text: &str) -> String {
@@ -131,196 +77,132 @@ fn html_escape(text: &str) -> String {
 /// Migrate notes from settings.json store to file-based storage.
 /// Returns the number of migrated notes.
 pub fn migrate_notes_from_store(app_handle: &AppHandle) -> Result<u32> {
-    let store = StoreBuilder::new(app_handle, crate::profiles::settings_store_path(app_handle)).build()?;
-
-    let notes_value = match store.get("notes") {
-        Some(value) => value.clone(),
-        None => return Ok(0), // No notes key, nothing to migrate
+    let scope = ProfileScope::active(app_handle)?;
+    let store = StoreBuilder::new(
+        app_handle,
+        crate::profiles::profile_store_path(scope.local_id(), "settings.json"),
+    )
+    .build()?;
+    let Some(value) = store.get("notes") else {
+        return Ok(0);
     };
-
-    let legacy_notes: Vec<LegacyNote> = match serde_json::from_value(notes_value) {
-        Ok(notes) => notes,
+    let legacy_notes: Vec<LegacyNote> = match serde_json::from_value(value.clone()) {
+        Ok(n) => n,
         Err(e) => {
             tracing::warn!("Failed to parse legacy notes from store: {}", e);
             return Ok(0);
         }
     };
-
-    if legacy_notes.is_empty() {
-        store.delete("notes");
-        let _ = store.save();
-        return Ok(0);
-    }
-
-    let notes_dir = get_notes_dir(app_handle)?;
-    let mut migrated = 0u32;
-
-    for note in &legacy_notes {
-        let note_dir = notes_dir.join(&note.id);
-
-        // Idempotent: skip if already migrated
-        if note_dir.exists() {
+    let migrated = NoteService::transaction(&scope, |profile| {
+        let mut migrated = 0;
+        for note in &legacy_notes {
+            crate::note_service::scope::validate_id(&note.id)?;
+            let path = profile.path(&std::path::Path::new("notes").join(&note.id))?;
+            if path.exists() {
+                migrated += 1;
+                continue;
+            }
+            let meta = NoteMeta {
+                id: note.id.clone(),
+                title: note.title.clone(),
+                created_at: note.created_at.clone(),
+                updated_at: note.updated_at.clone(),
+                favorite: false,
+                folder_id: None,
+                order: 0,
+                deleted_at: None,
+                local_only: false,
+            };
+            NoteService::mutate_locked(
+                profile,
+                MutationIntent::ImportNote {
+                    meta,
+                    content: text_to_html(&note.content),
+                },
+                Actor::Ui,
+            )?;
             migrated += 1;
-            continue;
         }
-
-        fs::create_dir_all(&note_dir)
-            .with_context(|| format!("Failed to create note directory: {}", note_dir.display()))?;
-
-        // Write metadata
-        let meta = NoteMeta {
-            id: note.id.clone(),
-            title: note.title.clone(),
-            created_at: note.created_at.clone(),
-            updated_at: note.updated_at.clone(),
-            favorite: false,
-            folder_id: None,
-            order: 0,
-            deleted_at: None,
-            local_only: false,
-        };
-        let meta_json = serde_json::to_string_pretty(&meta)?;
-        fs::write(note_dir.join("note.json"), meta_json)?;
-
-        // Convert plain text content to HTML
-        let html_content = text_to_html(&note.content);
-        fs::write(note_dir.join("content.html"), html_content)?;
-
-        migrated += 1;
-    }
-
-    // Remove notes key from store after successful migration
+        Ok(migrated)
+    })?;
     store.delete("notes");
     let _ = store.save();
-
     tracing::info!(
         "Migrated {} notes from settings.json to file-based storage",
         migrated
     );
-
     Ok(migrated)
 }
 
 #[tauri::command]
 pub async fn list_notes(app_handle: AppHandle) -> Result<Vec<NoteMeta>, String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-
-    let mut notes: Vec<NoteMeta> = Vec::new();
-
-    let entries = fs::read_dir(&notes_dir).map_err(|e| e.to_string())?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if let Ok(meta) = read_note_meta(&path) {
-            if is_note_active(&meta) {
-                notes.push(meta);
-            }
-        }
-    }
-
-    // Sort by updated_at descending
-    notes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-
-    Ok(notes)
+    let scope = ProfileScope::active(&app_handle).map_err(|e| e.to_string())?;
+    NoteRepository::list(&scope).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn read_note(app_handle: AppHandle, id: String) -> Result<NoteData, String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-    let note_dir = notes_dir.join(&id);
-
-    if !note_dir.exists() {
-        return Err(format!("Note not found: {}", id));
-    }
-
-    let meta = read_note_meta(&note_dir).map_err(|e| e.to_string())?;
-
-    let content_path = note_dir.join("content.html");
-    let content = fs::read_to_string(&content_path).unwrap_or_default();
-
-    Ok(NoteData { meta, content })
+    let scope = ProfileScope::active(&app_handle).map_err(|e| e.to_string())?;
+    NoteRepository::get(&scope, &id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn create_note(
     app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
     folder_id: Option<String>,
 ) -> Result<NoteMeta, String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let note_dir = notes_dir.join(&id);
-
-    fs::create_dir_all(&note_dir).map_err(|e| e.to_string())?;
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let meta = NoteMeta {
-        id,
-        title: "Untitled Note".to_string(),
-        created_at: now.clone(),
-        updated_at: now,
-        favorite: false,
-        folder_id,
-        order: 0,
-        deleted_at: None,
-        local_only: false,
-    };
-
-    let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-    fs::write(note_dir.join("note.json"), meta_json).map_err(|e| e.to_string())?;
-    fs::write(note_dir.join("content.html"), "").map_err(|e| e.to_string())?;
-
-    Ok(meta)
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::CreateNote { folder_id },
+        Actor::Ui,
+    )
+    .await
+    .and_then(MutationResult::note)
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn update_note(
     app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
     id: String,
     content: String,
     title: String,
 ) -> Result<NoteMeta, String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-    let note_dir = notes_dir.join(&id);
-
-    if !note_dir.exists() {
-        return Err(format!("Note not found: {}", id));
-    }
-
-    // Write content
-    fs::write(note_dir.join("content.html"), &content).map_err(|e| e.to_string())?;
-
-    // Update metadata
-    let mut meta = read_note_meta(&note_dir).map_err(|e| e.to_string())?;
-    meta.title = title;
-    meta.updated_at = chrono::Utc::now().to_rfc3339();
-
-    let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-    fs::write(note_dir.join("note.json"), meta_json).map_err(|e| e.to_string())?;
-
-    Ok(meta)
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::UpdateNote { id, content, title },
+        Actor::Ui,
+    )
+    .await
+    .and_then(MutationResult::note)
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn delete_note(app_handle: AppHandle, id: String) -> Result<(), String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-    let note_dir = notes_dir.join(&id);
-
-    if !note_dir.exists() {
-        return Ok(()); // idempotent
-    }
-
-    let mut meta = read_note_meta(&note_dir).map_err(|e| e.to_string())?;
-    let now = chrono::Utc::now().to_rfc3339();
-    meta.deleted_at = Some(now.clone());
-    meta.updated_at = now;
-
-    let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-    fs::write(note_dir.join("note.json"), meta_json).map_err(|e| e.to_string())?;
-
-    Ok(())
+pub async fn delete_note(
+    app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
+    id: String,
+) -> Result<(), String> {
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::DeleteNote { id },
+        Actor::Ui,
+    )
+    .await
+    .and_then(MutationResult::unit)
+    .map_err(|e| e.to_string())
 }
 
 /// Hard-delete soft-deleted notes after server confirmed they were purged.
@@ -330,43 +212,39 @@ pub async fn delete_note(app_handle: AppHandle, id: String) -> Result<(), String
 #[tauri::command]
 pub async fn purge_soft_deleted_notes_post_pull(
     app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
     note_ids: Vec<String>,
 ) -> Result<u32, String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-    let mut purged = 0u32;
-    for note_id in note_ids {
-        let note_dir = notes_dir.join(&note_id);
-        if !note_dir.exists() {
-            continue;
-        }
-        let meta = match read_note_meta(&note_dir) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.deleted_at.is_some() {
-            fs::remove_dir_all(&note_dir).map_err(|e| e.to_string())?;
-            purged += 1;
-        }
-    }
-    Ok(purged)
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::PurgeNotes { note_ids },
+        Actor::Remote,
+    )
+    .await
+    .and_then(MutationResult::count)
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn toggle_note_favorite(app_handle: AppHandle, id: String) -> Result<NoteMeta, String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-    let note_dir = notes_dir.join(&id);
-
-    if !note_dir.exists() {
-        return Err(format!("Note not found: {}", id));
-    }
-
-    let mut meta = read_note_meta(&note_dir).map_err(|e| e.to_string())?;
-    meta.favorite = !meta.favorite;
-
-    let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-    fs::write(note_dir.join("note.json"), meta_json).map_err(|e| e.to_string())?;
-
-    Ok(meta)
+pub async fn toggle_note_favorite(
+    app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
+    id: String,
+) -> Result<NoteMeta, String> {
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::ToggleFavorite { id },
+        Actor::Ui,
+    )
+    .await
+    .and_then(MutationResult::note)
+    .map_err(|e| e.to_string())
 }
 
 /// Set whether a note is "local only" (never synced to the cloud).
@@ -382,114 +260,68 @@ pub async fn toggle_note_favorite(app_handle: AppHandle, id: String) -> Result<N
 #[tauri::command]
 pub async fn set_note_local_only(
     app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
     id: String,
     local_only: bool,
 ) -> Result<NoteMeta, String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-    let note_dir = notes_dir.join(&id);
-
-    if !note_dir.exists() {
-        return Err(format!("Note not found: {}", id));
-    }
-
-    let mut meta = read_note_meta(&note_dir).map_err(|e| e.to_string())?;
-    meta.local_only = local_only;
-    if !local_only {
-        meta.updated_at = chrono::Utc::now().to_rfc3339();
-    }
-
-    let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-    fs::write(note_dir.join("note.json"), meta_json).map_err(|e| e.to_string())?;
-
-    Ok(meta)
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::SetLocalOnly { id, local_only },
+        Actor::Ui,
+    )
+    .await
+    .and_then(MutationResult::note)
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn move_note_to_folder(
     app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
     note_id: String,
     folder_id: Option<String>,
 ) -> Result<NoteMeta, String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-    let note_dir = notes_dir.join(&note_id);
-
-    if !note_dir.exists() {
-        return Err(format!("Note not found: {}", note_id));
-    }
-
-    let mut meta = read_note_meta(&note_dir).map_err(|e| e.to_string())?;
-    meta.folder_id = folder_id;
-    meta.updated_at = chrono::Utc::now().to_rfc3339();
-    // Reset order so the moved note sits at the top of its new folder until
-    // the user reorders that folder explicitly.
-    meta.order = 0;
-
-    let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-    fs::write(note_dir.join("note.json"), meta_json).map_err(|e| e.to_string())?;
-
-    Ok(meta)
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::MoveNote { note_id, folder_id },
+        Actor::Ui,
+    )
+    .await
+    .and_then(MutationResult::note)
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn reorder_notes_in_folder(
     app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
     folder_id: Option<String>,
     note_ids: Vec<String>,
 ) -> Result<(), String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-
-    for (index, note_id) in note_ids.iter().enumerate() {
-        let note_dir = notes_dir.join(note_id);
-        if !note_dir.exists() {
-            continue;
-        }
-        let mut meta = match read_note_meta(&note_dir) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        // Defensive: only update if the note is actually in the declared folder.
-        if meta.folder_id != folder_id {
-            continue;
-        }
-        meta.order = index as i32;
-        let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-        fs::write(note_dir.join("note.json"), meta_json).map_err(|e| e.to_string())?;
-    }
-
-    Ok(())
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::ReorderNotes {
+            folder_id,
+            note_ids,
+        },
+        Actor::Ui,
+    )
+    .await
+    .and_then(MutationResult::unit)
+    .map_err(|e| e.to_string())
 }
 
 /// Reset folder_id to None for all notes currently in the given folder.
 /// Used when a folder is deleted — notes become orphans (root) instead of being lost.
-pub fn orphan_notes_in_folder(app_handle: &AppHandle, folder_id: &str) -> Result<()> {
-    let notes_dir = get_notes_dir(app_handle)?;
-
-    let entries = fs::read_dir(&notes_dir)?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let mut meta = match read_note_meta(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        // Soft-deleted notes keep their folder_id intact (tombstone preservation).
-        if !is_note_active(&meta) {
-            continue;
-        }
-
-        if meta.folder_id.as_deref() == Some(folder_id) {
-            meta.folder_id = None;
-            let meta_json = serde_json::to_string_pretty(&meta)?;
-            fs::write(path.join("note.json"), meta_json)?;
-        }
-    }
-
-    Ok(())
-}
 
 /// Return all notes whose HTML content references `note_id` via a note-link node.
 /// The pattern looked up is literal: `data-note-id="{note_id}"`.
@@ -498,41 +330,8 @@ pub async fn get_backlinks(
     app_handle: AppHandle,
     note_id: String,
 ) -> Result<Vec<NoteMeta>, String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-    let needle = format!("data-note-id=\"{}\"", note_id);
-
-    let mut results: Vec<NoteMeta> = Vec::new();
-
-    let entries = fs::read_dir(&notes_dir).map_err(|e| e.to_string())?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        // Skip the note itself — self-references don't count as backlinks.
-        if path.file_name().and_then(|n| n.to_str()) == Some(note_id.as_str()) {
-            continue;
-        }
-
-        let content_path = path.join("content.html");
-        let html = match fs::read_to_string(&content_path) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-
-        if html.contains(&needle) {
-            if let Ok(meta) = read_note_meta(&path) {
-                if is_note_active(&meta) {
-                    results.push(meta);
-                }
-            }
-        }
-    }
-
-    results.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-
-    Ok(results)
+    let scope = ProfileScope::active(&app_handle).map_err(|e| e.to_string())?;
+    NoteRepository::backlinks(&scope, note_id).map_err(|e| e.to_string())
 }
 
 /// Imports a note for backup restore. The note's id, meta, and content_html
@@ -542,63 +341,28 @@ pub async fn get_backlinks(
 #[tauri::command]
 pub async fn import_note_for_backup(
     app_handle: AppHandle,
+    window: WebviewWindow,
+    session: Option<ProfileSession>,
     meta: NoteMeta,
     content: String,
+    source: Option<crate::note_service::mutation::ImportSource>,
 ) -> Result<(), String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-    let note_dir = notes_dir.join(&meta.id);
-    fs::create_dir_all(&note_dir).map_err(|e| e.to_string())?;
-    let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-    fs::write(note_dir.join("note.json"), meta_json).map_err(|e| e.to_string())?;
-    fs::write(note_dir.join("content.html"), content).map_err(|e| e.to_string())?;
-    Ok(())
+    mutate_ui(
+        &app_handle,
+        &window,
+        session,
+        MutationIntent::ImportNote { meta, content },
+        source.unwrap_or_default().into(),
+    )
+    .await
+    .and_then(MutationResult::unit)
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn search_notes(
-    app_handle: AppHandle,
-    query: String,
-) -> Result<Vec<NoteMeta>, String> {
-    let notes_dir = get_notes_dir(&app_handle).map_err(|e| e.to_string())?;
-    let lower_query = query.to_lowercase();
-
-    let mut results: Vec<NoteMeta> = Vec::new();
-
-    let entries = fs::read_dir(&notes_dir).map_err(|e| e.to_string())?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        if let Ok(meta) = read_note_meta(&path) {
-            if !is_note_active(&meta) {
-                continue;
-            }
-
-            let title_match = meta.title.to_lowercase().contains(&lower_query);
-
-            let content_match = if !title_match {
-                let content_path = path.join("content.html");
-                if let Ok(html) = fs::read_to_string(&content_path) {
-                    let text = strip_html_tags(&html);
-                    text.to_lowercase().contains(&lower_query)
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if title_match || content_match {
-                results.push(meta);
-            }
-        }
-    }
-
-    results.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-
-    Ok(results)
+pub async fn search_notes(app_handle: AppHandle, query: String) -> Result<Vec<NoteMeta>, String> {
+    let scope = ProfileScope::active(&app_handle).map_err(|e| e.to_string())?;
+    NoteRepository::search(&scope, query).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -672,10 +436,14 @@ mod tests {
         let tombstoned = make_meta(Some("2026-05-19T11:00:00Z".to_string()));
         let pulled_ids = vec!["test-id".to_string()];
         let is_pulled = |m: &NoteMeta| pulled_ids.contains(&m.id);
-        assert!(!(is_pulled(&active) && active.deleted_at.is_some()),
-            "active note should NOT be purged even if its id is in the pulled list");
-        assert!(is_pulled(&tombstoned) && tombstoned.deleted_at.is_some(),
-            "soft-deleted note with matching id SHOULD be purged");
+        assert!(
+            !(is_pulled(&active) && active.deleted_at.is_some()),
+            "active note should NOT be purged even if its id is in the pulled list"
+        );
+        assert!(
+            is_pulled(&tombstoned) && tombstoned.deleted_at.is_some(),
+            "soft-deleted note with matching id SHOULD be purged"
+        );
     }
 
     #[test]

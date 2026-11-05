@@ -9,11 +9,14 @@ const h = vi.hoisted(() => ({
   storeData: {} as Record<string, unknown>,
   pullAllSpy: vi.fn(),
   pushSpy: vi.fn(),
+  drainSpy: vi.fn(),
+  noteSpy: vi.fn(),
+  protectedKeys: new Set<string>(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: async (cmd: string) => {
-    if (cmd === "get_active_profile_sync_meta_path") return "meta.json";
+    if (cmd === "get_profile_sync_meta_path") return "meta.json";
     if (cmd === "get_or_create_device_id") return "device-B";
     if (cmd === "get_active_profile") return "default";
     if (cmd === "list_profiles") return [{ id: "default", name: "Test Profile", createdAt: "" }];
@@ -36,6 +39,8 @@ vi.mock("@tauri-apps/plugin-store", () => ({
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({ onFocusChanged: async () => () => {} }),
 }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: async () => () => {} }));
+vi.mock("@/lib/sync/local-outbox", () => ({ drainLocalOutbox: (...args: unknown[]) => h.drainSpy(...args), protectedEntityKeys: async () => h.protectedKeys }));
 
 vi.mock("@/hooks/useAuth", () => ({
   useAuth: () => ({ status: "signed-in" }),
@@ -59,6 +64,7 @@ vi.mock("@/lib/sync/client", () => ({
 // Queue: empty / inert.
 vi.mock("@/lib/sync/queue", () => ({
   enqueue: async () => {},
+  enqueueWithId: async () => {},
   peekAll: async () => [],
   peekReadyHead: async () => null,
   markRetry: async () => {},
@@ -66,6 +72,8 @@ vi.mock("@/lib/sync/queue", () => ({
   getDeadLetters: async () => [],
   MAX_RETRIES_BEFORE_DLQ: 5,
   size: async () => 0,
+  getQueueSession: async () => ({ profile_id: "default", session_generation: 1 }),
+  loadSnapshot: async () => ({ queue: [], deadLetters: [], protectedEntities: [] }),
 }));
 
 vi.mock("@/lib/sync/apply-batch-results", () => ({
@@ -79,7 +87,7 @@ vi.mock("@/lib/sync/snippets-store", () => ({
 }));
 
 vi.mock("@/lib/sync/notes-store", () => ({
-  applyRemoteNote: async () => {},
+  applyRemoteNote: (...args: unknown[]) => h.noteSpy(...args),
   flushPendingNoteUpdates: async () => {},
   listNotes: async () => [],
   readNote: async () => ({ meta: {}, content: "" }),
@@ -112,7 +120,10 @@ const EMPTY_PULL = {
 beforeEach(() => {
   Object.keys(h.storeData).forEach((k) => delete h.storeData[k]);
   h.pullAllSpy.mockReset().mockResolvedValue(EMPTY_PULL);
-  h.pushSpy.mockReset().mockResolvedValue({ ok: true, results: [], server_time: "2026-06-25T00:00:00Z" });
+  h.pushSpy.mockReset().mockImplementation(async (ops: unknown[]) => ({ ok: true, results: ops.map((_, index) => ({ index, ok: true })), server_time: "2026-06-25T00:00:00Z" }));
+  h.drainSpy.mockReset().mockResolvedValue({ state: "pending", imported: 0 });
+  h.noteSpy.mockReset().mockResolvedValue({ applied: true, deferred: false });
+  h.protectedKeys.clear();
 });
 
 describe("SyncContext — activation forces a full reconcile", () => {
@@ -152,5 +163,43 @@ describe("SyncContext — activation forces a full reconcile", () => {
     });
 
     expect(h.storeData["last_pull_at"]).toBeNull();
+  });
+  it("absorbs work intentions before pull and confirms profile in a separate request", async () => {
+    const { result } = renderHook(() => useContext(SyncContext), { wrapper: SyncProvider });
+    await act(async () => { await result.current!.enableSync(); });
+    expect(h.drainSpy.mock.invocationCallOrder[0]).toBeLessThan(h.pullAllSpy.mock.invocationCallOrder[0]);
+    const firstOps = h.pushSpy.mock.calls[0][0];
+    expect(firstOps).toHaveLength(1);
+    expect(firstOps[0].kind).toBe("profile-upsert");
+  });
+  it("deferred rows retain a full reread after queue confirmation or DLQ discard", async () => {
+    h.protectedKeys.add("note:n");
+    h.pullAllSpy.mockResolvedValue({ ...EMPTY_PULL, notes: [{ id: "n", title: "remote", content_html: "remote", folder_id: null, favorite: false, order: 0, created_at: "2026-11-05T00:00:00Z", updated_at: "2026-11-05T00:00:00Z", deleted_at: null }] });
+    const { result } = renderHook(() => useContext(SyncContext), { wrapper: SyncProvider });
+    await act(async () => { await result.current!.enableSync(); });
+    expect(h.noteSpy).not.toHaveBeenCalled();
+    expect(h.storeData.last_pull_at).toBeNull();
+    h.protectedKeys.clear();
+    await act(async () => { await result.current!.syncNow(); });
+    expect(h.pullAllSpy.mock.calls[h.pullAllSpy.mock.calls.length - 1][0]).toBeNull();
+    expect(h.noteSpy).toHaveBeenCalledWith(expect.objectContaining({ id: "n" }));
+  });
+  it("serializes overlapping pulls so an older response cannot follow a newer tombstone purge", async () => {
+    let release: (() => void) | undefined;
+    let active = 0;
+    let maximum = 0;
+    h.pullAllSpy.mockImplementation(async () => {
+      active++; maximum = Math.max(maximum, active);
+      if (!release) await new Promise<void>(resolve => { release = resolve; });
+      active--; return EMPTY_PULL;
+    });
+    const { result } = renderHook(() => useContext(SyncContext), { wrapper: SyncProvider });
+    let activation: Promise<void> | undefined;
+    await act(async () => { activation = result.current!.enableSync(); await vi.waitFor(() => expect(release).toBeTypeOf("function")); });
+    await act(async () => { await result.current!.syncNow(); });
+    expect(h.pullAllSpy).toHaveBeenCalledOnce();
+    await act(async () => { release!(); await activation; });
+    expect(h.pullAllSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(maximum).toBe(1);
   });
 });

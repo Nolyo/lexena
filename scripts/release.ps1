@@ -17,7 +17,8 @@
 [CmdletBinding()]
 param(
     [switch]$Prerelease,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [ValidateSet("x86_64-pc-windows-msvc")][string]$Target = "x86_64-pc-windows-msvc"
 )
 
 Set-StrictMode -Version Latest
@@ -90,6 +91,20 @@ foreach ($t in @($TAG, $VERSION, "v-$VERSION")) {
 
 Write-Ok "Tag '$TAG' is free"
 
+# Ask Cargo for the effective target directory, including environment/config overrides.
+# Use an explicit target for both Tauri and its sidecar hook; never infer one from filenames.
+Push-Location "src-tauri"
+try {
+    $metadataText = cargo metadata --locked --no-deps --format-version 1
+    if ($LASTEXITCODE -ne 0) { throw "Could not resolve Cargo target directory" }
+} finally { Pop-Location }
+$targetRoot = [IO.Path]::GetFullPath(($metadataText | ConvertFrom-Json).target_directory)
+$releaseDir = Join-Path $targetRoot "$Target\release"
+$bundleDir = [IO.Path]::GetFullPath((Join-Path $releaseDir "bundle"))
+if (-not $bundleDir.StartsWith($targetRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -or (Split-Path $bundleDir -Leaf) -ne "bundle") {
+    Write-Fail "Refusing unsafe bundle cleanup path: $bundleDir"
+}
+
 # --- Step 4: Build ---
 
 Write-Step "Building application (pnpm tauri build)"
@@ -118,13 +133,15 @@ $env:TAURI_SIGNING_PRIVATE_KEY = $privateKeyContent.Trim()
 # $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
 
 Write-Ok "Cleaning old bundle artifacts to avoid stale files"
-Get-ChildItem "src-tauri\target\release\bundle" -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $bundleDir) { Remove-Item -LiteralPath $bundleDir -Force -Recurse }
 
-pnpm tauri build
-if ($LASTEXITCODE -ne 0) { Write-Fail "Build failed (exit code $LASTEXITCODE)" }
-
-Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
-Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+try {
+    pnpm tauri build --target $Target
+    if ($LASTEXITCODE -ne 0) { throw "Build failed (exit code $LASTEXITCODE)" }
+} finally {
+    Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+    Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+}
 
 Write-Ok "Build succeeded"
 
@@ -132,22 +149,15 @@ Write-Ok "Build succeeded"
 
 Write-Step "Locating build artifacts"
 
-# Resolve Cargo target directory: check .cargo/config.toml overrides first
-$cargoConfig = "src-tauri\.cargo\config.toml"
-$releaseDir = "src-tauri\target\release"
-if (Test-Path $cargoConfig) {
-    $targetDirLine = Get-Content $cargoConfig | Where-Object { $_ -match '\btarget-dir\s*=' }
-    if ($targetDirLine) {
-        $targetDirValue = ($targetDirLine -replace '.*=\s*"?([^"]+)"?.*', '$1').Trim().Trim('"')
-        $releaseDir = Join-Path $targetDirValue "release"
-        Write-Ok "target-dir (from .cargo/config.toml): $targetDirValue"
-    }
-}
-$bundleDir = "$releaseDir\bundle"
-
 $portableSrc = Join-Path $releaseDir "lexena.exe"
 if (-not (Test-Path $portableSrc)) { Write-Fail "Portable EXE not found: $portableSrc" }
 Write-Ok "Portable   : $portableSrc"
+$bridgeSrc = Join-Path $releaseDir "lexena-mcp.exe"
+$stagedBridge = "src-tauri\binaries\lexena-mcp-$Target.exe"
+if (-not (Test-Path -LiteralPath $bridgeSrc)) { Write-Fail "MCP bridge not found beside application: $bridgeSrc" }
+if ((Get-FileHash -LiteralPath $bridgeSrc -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $stagedBridge -Algorithm SHA256).Hash) {
+    Write-Fail "Bundled MCP bridge differs from current target build"
+}
 
 $nsisExeSrc = Resolve-Glob "$bundleDir\nsis\Lexena_${VERSION}_x64-setup.exe"
 if (-not $nsisExeSrc) { Write-Fail "NSIS setup EXE not found for version $VERSION in $bundleDir\nsis\" }
@@ -166,9 +176,12 @@ New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
 
 $portableDest = "$stagingDir\lexena-$TAG-portable.exe"
 $nsisExeDest  = "$stagingDir\lexena-$TAG-setup.exe"
+$portableMcpDest = "$stagingDir\lexena-$TAG-portable-mcp.zip"
 
 Copy-Item $portableSrc          $portableDest
 Copy-Item $nsisExeSrc.FullName  $nsisExeDest
+& "$PSScriptRoot\package-mcp-portable.ps1" -AppPath $portableSrc -BridgePath $bridgeSrc -Destination $portableMcpDest -Target $Target
+if (-not (Test-Path -LiteralPath $portableMcpDest)) { Write-Fail "Portable MCP ZIP was not produced" }
 
 Write-Ok "Staged $((Get-ChildItem $stagingDir).Count) files"
 
@@ -209,7 +222,7 @@ Write-Step "Generating SHA256 checksums"
 $checksumPath = "$stagingDir\checksums-$TAG.txt"
 Remove-Item $checksumPath -ErrorAction SilentlyContinue
 
-$filesToChecksum = @($portableDest, $nsisExeDest)
+$filesToChecksum = @($portableDest, $nsisExeDest, $portableMcpDest)
 foreach ($file in $filesToChecksum) {
     $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
     $name = Split-Path $file -Leaf
@@ -247,7 +260,8 @@ See the [CHANGELOG](https://github.com/Nolyo/lexena/blob/$TAG/CHANGELOG.md) for 
 
 ## Downloads
 
-- **lexena-$TAG-portable.exe** : Portable version (no installation required)
+- **lexena-$TAG-portable.exe** : Historical standalone portable executable (MCP requires the ZIP below)
+- **lexena-$TAG-portable-mcp.zip** : Portable MCP package; extract both executables and mcp-version.json together
 - **lexena-$TAG-setup.exe** : NSIS installer (recommended)
 
 Verify file integrity using the provided SHA256 checksums.
@@ -266,6 +280,7 @@ $ghArgs = @(
     "--title", "Lexena $TAG",
     "--notes", $releaseNotes,
     $portableDest,
+    $portableMcpDest,
     $nsisExeDest,
     $latestJsonPath,
     $latestBetaJsonPath,

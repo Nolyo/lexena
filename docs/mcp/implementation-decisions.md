@@ -19,18 +19,28 @@ Références : [SDK 3.8.0](https://docs.rs/rmcp/3.8.0/rmcp/), sources publiées 
 
 ## IPC privé v1
 
-Le handshake est invisible au client stdio. Après Ready, framing MCP standard JSON-RPC UTF-8 terminé par LF.
+Le handshake est invisible au client stdio. Après Accepted, framing MCP standard JSON-RPC UTF-8 terminé par LF.
 
-- Pipe `\\.\pipe\lexena-mcp-<installation_uuid>`. Descripteur privé `mcp/endpoint.json` : `installation_id`, `pipe_name`, `server_executable` canonique, `ipc_version: 1`, `app_version`. Écriture atomique, aucun secret.
+- Pipe `\\.\pipe\lexena-mcp-<installation_uuid>`. Descripteur privé `mcp/endpoint.json` : `installation_id`, `pipe_name`, `server_path` canonique, `version: 1`, `app_version`. Écriture atomique, aucun secret.
 - Frame : longueur **u32 little-endian**, JSON UTF-8 de **1 à 4096 octets**, champs inconnus refusés, délai total **5 s**, aucun downgrade implicite.
-- Ordre : `ClientHello { version:1, installation_id, connection_id, client_nonce }` → `ServerChallenge { version:1, server_nonce, proof }` → `ClientProof { version:1, proof }` → `Ready { version:1 }`. Toute erreur ferme le flux avant MCP.
-- Nonces et preuves : 64 caractères hex minuscules, 32 octets décodés. Transcript : ASCII `lexena-mcp-ipc-v1\0`, rôle ASCII `server\0` ou `client\0`, UUID installation 16 octets RFC, UUID connexion 16 octets RFC, nonce client 32 octets, nonce serveur 32 octets. Le domaine lie la version.
+- Ordre : `ClientHello { version:1, role:"client", installation_id, connection_id, nonce }` → `ServerHello { version:1, role:"server", nonce, proof }` → `ClientProof { role:"client", proof }` → `Accepted { accepted:true }`. Toute erreur ferme le flux avant MCP.
+- Nonces et preuves : tableaux JSON de exactement 32 octets entiers (0..255), tailles contrôlées par les types serde. Transcript : ASCII `lexena-mcp-ipc-v1\0`, rôle ASCII `server\0` ou `client\0`, UUID installation 16 octets RFC, UUID connexion 16 octets RFC, nonce client 32 octets, nonce serveur 32 octets. Le domaine lie la version.
 - HMAC-SHA256, secret de connexion 256 bits dans keyring Windows existant, nonces CSPRNG OS. Comparaison constante des 32 octets ; vérifier preuve serveur avant de fournir preuve client. Échec fermé sans coffre, aucune sauvegarde de secret.
 - DACL explicite privée SID courant, non héritée ; reject_remote_clients(true) ; first_pipe_instance(true). Vérifier côté liaison GetNamedPipeServerProcessId, QueryFullProcessImageNameW, chemin canonique attendu et cohérence avec l'installation du bridge. Aucun scan d'autres pipes.
 - Maximum 8 connexions, 4 requêtes métier en vol/connexion, délai ordinaire 30 s. Révocation ferme les sessions et bloque les nouveaux commits ; terminer les commits déjà durables.
 - `mcp-ipc` : framing/auth/endpoint/pipe uniquement, sans Tauri ni métier. Pas de bind TCP/UDP/HTTP. Refus explicite des plateformes non validées.
 
 La protection ne constitue pas une sandbox contre un logiciel malveillant sous le même compte Windows.
+
+Les structures ci-dessus décrivent les trames privées effectivement testées, avec rôles explicites et tableaux d'octets de taille fixe. Elles remplacent les noms illustratifs et l'encodage hex envisagés au spike. Ce canal interne est commun aux deux binaires livrés ; les clients IA ne le parlent pas et utilisent le framing MCP stdio standard.
+
+## Stockage et réconciliation livrés
+
+Le HTML et les métadonnées restent dans le format de notes existant. `profiles/<id>/note-service/` contient le journal de redo, les révisions, reçus, versions et intentions locales. Toutes les mutations UI, imports et MCP passent par le service commun ; les éditeurs et la queue utilisent une session de profil capturée.
+
+`sync-queue.json` a un propriétaire Rust unique avec snapshot atomique, CAS, DLQ et watermark d'import. Les marqueurs de protection sans contenu conservent localement les éléments temporairement inéligibles. Une intention acquittée dans la queue n'est pas une confirmation cloud. L'ordre confirmé reste profil, dossiers, puis notes.
+
+Le cache de lecture dérivé est borné à 32 Mio. Il réutilise les révisions par note, se renouvelle lors des mutations du service et ne constitue pas un nouveau stockage de référence. Une construction longue ne retient pas le verrou d'autorisation : une vérification actuelle précède la construction et une nouvelle autorisation retenue précède tout résultat. Les mutations durables gardent leur autorisation pendant tout le commit. Un lecteur public ne charge pas le corps d'une note locale pour construire son cache.
 
 ## Dépendances publiées et verrouillées
 

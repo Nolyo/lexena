@@ -2,9 +2,22 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 const storeData: Record<string, unknown> = {};
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: async (cmd: string) => {
-    if (cmd === "get_active_profile_sync_queue_path") {
-      return "profiles/default/sync-queue.json";
+  invoke: async (cmd: string, args?: Record<string, unknown>) => {
+    if (cmd === "get_profile_session") {
+      return { profile_id: "default", session_generation: 1 };
+    }
+    if (cmd === "load_sync_queue") {
+      return structuredClone(storeData.snapshot ?? {
+        queue: [], deadLetters: [], importedOutboxSequence: 0, revision: "absent-v1",
+      });
+    }
+    if (cmd === "save_sync_queue") {
+      const current = storeData.snapshot as { revision: string } | undefined;
+      if (args?.expectedRevision !== (current?.revision ?? "absent-v1")) {
+        throw new Error("SYNC_QUEUE_REVISION_CONFLICT");
+      }
+      storeData.snapshot = { ...structuredClone(args?.snapshot as object), revision: crypto.randomUUID() };
+      return structuredClone(storeData.snapshot);
     }
     throw new Error(`unexpected invoke ${cmd}`);
   },

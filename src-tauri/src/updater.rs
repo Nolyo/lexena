@@ -88,7 +88,8 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
             .build()
             .map_err(|e| format!("Failed to load settings: {}", e))?;
 
-        store.get("settings")
+        store
+            .get("settings")
             .and_then(|v| v.get("settings").cloned())
             .and_then(|v| v.get("update_channel").cloned())
             .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -101,11 +102,15 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
         _ => "https://github.com/Nolyo/lexena/releases/latest/download/latest.json", // Default to stable
     };
 
-    tracing::info!("Checking for updates on channel '{}' from: {}", channel, endpoint_url);
+    tracing::info!(
+        "Checking for updates on channel '{}' from: {}",
+        channel,
+        endpoint_url
+    );
 
     // Parse URL
-    let url = Url::parse(endpoint_url)
-        .map_err(|e| format!("Failed to parse endpoint URL: {}", e))?;
+    let url =
+        Url::parse(endpoint_url).map_err(|e| format!("Failed to parse endpoint URL: {}", e))?;
 
     // Use updater_builder to set dynamic endpoint
     let updater = app
@@ -159,7 +164,8 @@ pub async fn download_and_install_update(app: AppHandle) -> Result<(), String> {
             .build()
             .map_err(|e| format!("Failed to load settings: {}", e))?;
 
-        store.get("settings")
+        store
+            .get("settings")
             .and_then(|v| v.get("settings").cloned())
             .and_then(|v| v.get("update_channel").cloned())
             .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -172,11 +178,15 @@ pub async fn download_and_install_update(app: AppHandle) -> Result<(), String> {
         _ => "https://github.com/Nolyo/lexena/releases/latest/download/latest.json",
     };
 
-    tracing::info!("Downloading update from channel '{}': {}", channel, endpoint_url);
+    tracing::info!(
+        "Downloading update from channel '{}': {}",
+        channel,
+        endpoint_url
+    );
 
     // Parse URL
-    let url = Url::parse(endpoint_url)
-        .map_err(|e| format!("Failed to parse endpoint URL: {}", e))?;
+    let url =
+        Url::parse(endpoint_url).map_err(|e| format!("Failed to parse endpoint URL: {}", e))?;
 
     // Use updater_builder to set dynamic endpoint
     let updater = app
@@ -198,8 +208,8 @@ pub async fn download_and_install_update(app: AppHandle) -> Result<(), String> {
         let bytes_downloaded = std::sync::Arc::new(parking_lot::Mutex::new(0u64));
         let bytes_total = std::sync::Arc::new(parking_lot::Mutex::new(None));
 
-        update
-            .download_and_install(
+        let bytes = update
+            .download(
                 |chunk_length, content_length| {
                     // Update progress
                     let mut downloaded = bytes_downloaded.lock();
@@ -242,7 +252,21 @@ pub async fn download_and_install_update(app: AppHandle) -> Result<(), String> {
                 },
             )
             .await
-            .map_err(|e| format!("Failed to download and install update: {}", e))?;
+            .map_err(|e| format!("Failed to download and verify update: {}", e))?;
+
+        // Download keeps normal use available and verifies the existing signed
+        // installer before maintenance. Then drain durable commits and close
+        // stdio bridges so the installer can replace both shipped executables.
+        #[cfg(windows)]
+        if let Err(error) = crate::mcp::lifecycle::prepare_update(&app).await {
+            crate::mcp::lifecycle::resume(&app).await;
+            return Err(error);
+        }
+        if let Err(error) = update.install(bytes) {
+            #[cfg(windows)]
+            crate::mcp::lifecycle::resume(&app).await;
+            return Err(format!("Failed to install update: {}", error));
+        }
 
         tracing::info!("Restarting application...");
 

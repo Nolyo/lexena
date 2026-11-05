@@ -1,6 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import i18n from '@/i18n';
+import { deriveNoteTitle } from '@/lib/notes/title';
+import { createNoteMetadataRefresh, mergeNoteMetadata, type MetadataChange, type MetadataSession } from '@/lib/notes/metadata-refresh';
+import { getQueueSession } from '@/lib/sync/queue';
 import {
   createNoteSynced,
   deleteNoteSynced,
@@ -42,6 +46,7 @@ export interface NoteMeta {
   folderId?: string;
   order: number;
   localOnly?: boolean;
+  deletedAt?: string;
 }
 
 export interface NoteData {
@@ -50,12 +55,7 @@ export interface NoteData {
 }
 
 export function deriveTitle(content: string): string {
-  // Extract text from HTML by stripping tags
-  const text = content.replace(/<[^>]*>/g, '\n').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
-  const firstLine = text.split('\n').find(line => line.trim().length > 0);
-  if (!firstLine) return i18n.t('notes.editor.untitled');
-  const trimmed = firstLine.trim();
-  return trimmed.length > 50 ? trimmed.slice(0, 50) + '...' : trimmed;
+  return deriveNoteTitle(content, i18n.t('notes.editor.untitled'));
 }
 
 export function useNotes() {
@@ -74,7 +74,7 @@ export function useNotes() {
         const meta = await createNoteSynced(null);
         const welcomeHtml = getWelcomeNoteHtml();
         const title = deriveTitle(welcomeHtml);
-        const persistedMeta = await invoke<NoteMeta>('update_note', { id: meta.id, content: welcomeHtml, title });
+        const persistedMeta = await invoke<NoteMeta>('update_note', { id: meta.id, content: welcomeHtml, title, session: await getQueueSession() });
         await pushNoteUpdate(persistedMeta, welcomeHtml);
         const updated = await invoke<NoteMeta[]>('list_notes');
         setNotes(updated);
@@ -91,6 +91,19 @@ export function useNotes() {
   useEffect(() => {
     loadNotes();
   }, [loadNotes]);
+
+  useEffect(() => {
+    let disposed = false;
+    let refresh: ReturnType<typeof createNoteMetadataRefresh> | undefined;
+    const subscription = invoke<MetadataSession>('get_profile_session').then(session => {
+      if (disposed) return () => {};
+      refresh = createNoteMetadataRefresh(session,
+        (ids, values) => setNotes(previous => mergeNoteMetadata(previous, ids, values)),
+        error => console.warn('Note metadata refresh failed', error));
+      return listen<MetadataChange>('note-service-changed', event => refresh?.enqueue(event.payload));
+    });
+    return () => { disposed = true; refresh?.dispose(); void subscription.then(unlisten => unlisten()).catch(() => {}); };
+  }, []);
 
   const createNote = async (folderId: string | null = null): Promise<NoteMeta> => {
     const meta = await createNoteSynced(folderId);
@@ -109,12 +122,17 @@ export function useNotes() {
 
   const updateNote = async (id: string, content: string, title: string) => {
     // 1) Local disk write immediate (no debounce on filesystem persistence).
-    const updated = await invoke<NoteMeta>('update_note', { id, content, title });
+    const updated = await invoke<NoteMeta>('update_note', { id, content, title, session: await getQueueSession() });
     setNotes(prev => prev.map(n => n.id === id ? updated : n));
 
     // 2) Debounce 2s the cloud push to coalesce rapid keystrokes into one upsert.
     scheduleNoteUpdatePush(id, updated, content, UPDATE_NOTE_PUSH_DEBOUNCE_MS);
   };
+
+  /** Ownership service already committed content; update React metadata only. */
+  const applySavedNoteMeta = useCallback((meta: NoteMeta) => {
+    setNotes(prev => prev.map(note => note.id === meta.id ? meta : note));
+  }, []);
 
   /** Apply title/updatedAt coming from a detached window's save event —
    *  keeps the sidebar fresh without re-reading every note from disk. */
@@ -161,7 +179,7 @@ export function useNotes() {
       }),
     );
     try {
-      await invoke('reorder_notes_in_folder', { folderId, noteIds });
+      await invoke('reorder_notes_in_folder', { folderId, noteIds, session: await getQueueSession() });
       // Reorder bumps `order` + `updated_at` on each touched note — enqueue an upsert
       // per moved note so the cloud picks up the new ordering via LWW. We read fresh
       // meta + content via `read_note` after the Rust command persists.
@@ -195,6 +213,7 @@ export function useNotes() {
       await invoke('reorder_notes_in_folder', {
         folderId: targetFolderId,
         noteIds: noteIdsInNewOrder,
+        session: await getQueueSession(),
       });
       for (const id of noteIdsInNewOrder) {
         try {
@@ -220,6 +239,7 @@ export function useNotes() {
     createNote,
     readNote,
     updateNote,
+    applySavedNoteMeta,
     applyExternalNoteMeta,
     deleteNote,
     searchNotes,

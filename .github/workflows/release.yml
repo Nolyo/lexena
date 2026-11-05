@@ -57,4 +57,13 @@ jobs:
           gh release download ${{ github.ref_name }} --dir src-tauri/target/release/bundle --pattern '*'
 
       - name: Scan bundles for leaked secrets
-        run: node .github/scripts/scan-secrets-in-bundles.mjs
+        # Compressed ZIP bytes do not expose embedded EXE strings. Extract the
+        # portable MCP package before scanning, including native binaries >50MB.
+        run: |
+          for archive in src-tauri/target/release/bundle/*-portable-mcp.zip; do
+            if [ -f "$archive" ]; then
+              mkdir -p src-tauri/target/release/portable-mcp
+              unzip -o "$archive" -d src-tauri/target/release/portable-mcp
+            fi
+          done
+          node .github/scripts/scan-secrets-in-bundles.mjs

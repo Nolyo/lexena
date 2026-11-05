@@ -176,10 +176,12 @@ export function useNotesWorkflow({
 
   const handleDeleteNote = useCallback(
     async (id: string) => {
-      // Read BEFORE mutating (fresh ref snapshot): was this note detached?
+      // A dirty owner rejects deletion. Keep its window, tab and buffer intact
+      // until the native ownership barrier and durable delete have succeeded.
       const wasDetached = tabsStateRef.current.detachedNoteIds.includes(id);
-      // Remove from the registry BEFORE closing so the note-window-closed
-      // handler can't resurrect the tab (spec §4).
+      await deleteNote(id);
+      // Delete committed: forget before requesting close so its completion
+      // cannot resurrect the deleted note as a tab.
       setTabsState((prev) => forgetNote(prev, id));
       if (wasDetached) {
         try {
@@ -188,7 +190,6 @@ export function useNotesWorkflow({
           console.error("Failed to close note window:", error);
         }
       }
-      await deleteNote(id);
     },
     [deleteNote],
   );

@@ -2,13 +2,16 @@ use tauri::{AppHandle, LogicalSize, Manager, Size};
 use tauri_plugin_store::StoreBuilder;
 
 use crate::window::{
-    DEFAULT_MINI_HEIGHT, DEFAULT_MINI_WIDTH, capture_mini_window_state, hide_mini_window,
-    position_mini_window,
+    capture_mini_window_state, hide_mini_window, position_mini_window, DEFAULT_MINI_HEIGHT,
+    DEFAULT_MINI_WIDTH,
 };
 
 /// Exit the application completely
 #[tauri::command]
 pub fn exit_app(app_handle: AppHandle) {
+    #[cfg(windows)]
+    crate::mcp::lifecycle::quit(app_handle);
+    #[cfg(not(windows))]
     app_handle.exit(0);
 }
 
@@ -87,9 +90,21 @@ pub async fn open_note_window(
     if !crate::notes::is_valid_note_id(&note_id) {
         return Err("Invalid note id".to_string());
     }
-    if !crate::notes::note_exists(&app_handle, &note_id) {
-        return Err("Note not found".to_string());
-    }
+    let profile =
+        crate::note_service::ProfileScope::active(&app_handle).map_err(|e| e.to_string())?;
+    profile
+        .transaction(|p| {
+            if !p.is_active()? {
+                return Err(crate::note_service::DomainError::EditorSessionExpired);
+            }
+            crate::note_service::NoteRepository::get_locked(p, &note_id)?;
+            let registry = crate::note_service::editors::editors();
+            registry.bind_window(
+                &crate::window::note_window_label(&note_id),
+                registry.session(p.scope().local_id()),
+            )
+        })
+        .map_err(|e| e.to_string())?;
     crate::window::open_note_window(&app_handle, &note_id, at_cursor.unwrap_or(false))?;
     tracing::info!("Note window opened for {}", note_id);
     Ok(())
@@ -125,7 +140,9 @@ pub fn show_main_window(app_handle: AppHandle) {
 pub(crate) fn close_all_note_windows(app_handle: &AppHandle) {
     for (label, window) in app_handle.webview_windows() {
         if label.starts_with("note-") {
-            let _ = window.close();
+            // Profile switch already committed a clean-editor barrier and
+            // invalidated old sessions; do not ask an expired renderer to save.
+            let _ = window.destroy();
         }
     }
 }
