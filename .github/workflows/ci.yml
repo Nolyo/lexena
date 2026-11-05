@@ -33,7 +33,8 @@ jobs:
 
   cargo-test:
     name: Rust tests (cargo test)
-    runs-on: windows-latest
+    # The pinned cmake crate cannot auto-detect Visual Studio 2026.
+    runs-on: windows-2022
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
