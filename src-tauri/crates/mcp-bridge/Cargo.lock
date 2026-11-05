@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "lexena-mcp"
-version = "3.2.2-beta.1"
+version = "3.3.0-beta.1"
 dependencies = [
  "chrono",
  "lexena-mcp-ipc",
